@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::io::Write;
 use time::Timespec;
-use fuse::{Filesystem, FileAttr, FileType, Request, ReplyAttr, ReplyDirectory, ReplyEntry, ReplyData};
+use fuse::{Filesystem, FileAttr, FileType, Request, ReplyAttr, ReplyDirectory, ReplyEntry, ReplyData, ReplyOpen};
 use git2::{Repository, Oid, ObjectType};
 use libc::{c_int, ENOENT, ENOTDIR, EISDIR};
 use openat::Dir;
@@ -10,6 +10,7 @@ use openat::Dir;
 type InoMap = BTreeMap<u64, Oid>;
 type OidMap = HashMap<Oid, u64>;
 
+/// GitFS.
 pub struct GitFS {
     repo: Repository,
     dir: Dir,
@@ -127,6 +128,13 @@ impl Filesystem for GitFS {
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         reply.attr(&GitFS::ttl(), &self.make_attr(ino));
+    }
+
+    fn opendir(&mut self, _req: &Request, ino: u64, mut reply: ReplyOpen) {
+        for entry in tree.iter() {
+            dir.add(entry.name_bytes(), );
+        }
+        reply.opened();
     }
 
     fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
