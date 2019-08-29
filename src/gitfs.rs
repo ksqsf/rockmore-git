@@ -1,24 +1,28 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
+use std::io::Write;
 use time::Timespec;
 use fuse::{Filesystem, FileAttr, FileType, Request, ReplyAttr, ReplyDirectory, ReplyEntry, ReplyData};
 use git2::{Repository, Oid, ObjectType};
 use libc::{c_int, ENOENT, ENOTDIR, EISDIR};
+use openat::Dir;
 
 type InoMap = BTreeMap<u64, Oid>;
 type OidMap = HashMap<Oid, u64>;
 
 pub struct GitFS {
     repo: Repository,
+    dir: Dir,
     commitish: Option<Oid>,
     inomap: InoMap,
     oidmap: OidMap,
 }
 
 impl GitFS {
-    pub fn new(repo: Repository, commitish: Option<Oid>) -> GitFS {
+    pub fn new(repo: Repository, dir: Dir, commitish: Option<Oid>) -> GitFS {
         GitFS {
             repo,
+            dir,
             commitish,
             inomap: InoMap::new(),
             oidmap: OidMap::new(),
@@ -79,6 +83,9 @@ impl GitFS {
 
 impl Filesystem for GitFS {
     fn init(&mut self, _req: &Request) -> Result<(), c_int> {
+        let mut f = self.dir.write_file("write_when_mounted", 0o644).unwrap();
+        f.write(b"just a test...\ng").unwrap();
+
         let tree_id = match self.commitish {
             Some(commitish) => self.repo.find_commit(commitish).unwrap().tree().unwrap().id(),
             None => self.repo.head().unwrap().peel_to_commit().unwrap().tree().unwrap().id(),
