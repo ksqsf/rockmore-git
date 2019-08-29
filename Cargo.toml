@@ -6,9 +6,13 @@ edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[[bin]]
+name = "git-mount"
+path = "bin/git-mount.rs"
+
 [dependencies]
 fuse = "0.3"
-git2 = "0.10"
+git2 = { git = "https://github.com/ksqsf/git2-rs" }
 log = "0.4"
 env_logger = "0.6"
 clap = "2.33.0"
