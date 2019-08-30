@@ -191,7 +191,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 [[package]]
 name = "openat"
 version = "0.1.18"
-source = "git+https://github.com/ksqsf/openat#55357cb093d473618ad3c78cb76bccbdf7661a80"
+source = "git+https://github.com/ksqsf/openat#04613771f63e2e6831cb9235da19cc724de4e3a6"
 dependencies = [
  "libc 0.2.62 (registry+https://github.com/rust-lang/crates.io-index)",
 ]

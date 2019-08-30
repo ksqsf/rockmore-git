@@ -9,16 +9,19 @@
 /// Please read the source code for the details.
 use std::ffi::{OsStr, OsString};
 use std::fs::Permissions;
+use std::io;
+use std::io::SeekFrom;
+use std::io::{Read, Seek, Write};
 use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
 use time::Timespec;
 
 use fuse::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen,
-    Request,
+    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    ReplyOpen, ReplyWrite, Request,
 };
 use git2::{Error as GitError, ObjectType, Oid, Repository, Tree};
-use libc::{c_int, EISDIR, ENOENT, ENOTDIR};
-use openat::Dir;
+use libc::{c_int, EIO, EISDIR, ENOENT, ENOTDIR, O_RDONLY};
+use openat::{Dir, SimpleType};
 use std::collections::HashMap;
 
 use crate::{Entry, EntryKind, Ino, InoMap};
@@ -32,9 +35,20 @@ macro_rules! some {
     };
 }
 
+macro_rules! io_ok {
+    ($value:expr, $reply:ident, $default_errno:expr) => {
+        match $value {
+            Ok(value) => value,
+            Err(e) => return $reply.error(e.raw_os_error().unwrap_or($default_errno)),
+        }
+    };
+    ($value:expr, $reply:ident) => {
+        io_ok!($value, $reply, libc::EIO)
+    };
+}
+
 pub struct GitFS {
     repo: Repository,
-    #[allow(unused)]
     underlying_dir: Dir,
     inomap: InoMap,
 }
@@ -60,28 +74,6 @@ impl Filesystem for GitFS {
         Ok(())
     }
 
-    fn read(
-        &mut self,
-        _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        size: u32,
-        reply: ReplyData,
-    ) {
-        let entry = some!(self.inomap.get(ino.into()), reply, ENOENT);
-        let offset = offset as usize;
-        let size = size as usize;
-        match entry.u {
-            EntryKind::GitBlob { oid, .. } => {
-                let blob = self.repo.find_blob(oid).unwrap();
-                return reply.data(&blob.content()[offset..offset + size]);
-            }
-            EntryKind::DirtyFile { .. } => unimplemented!(),
-            EntryKind::GitTree { .. } | EntryKind::DirtyDir { .. } => return reply.error(EISDIR),
-        }
-    }
-
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let parent_entry = some!(self.inomap.get(parent.into()), reply, ENOENT);
         match &parent_entry.u {
@@ -93,7 +85,18 @@ impl Filesystem for GitFS {
                 let child_entry = some!(self.inomap.get(child), reply, ENOENT);
                 return reply.entry(&Self::ttl(), &self.make_attr(child, child_entry), 0);
             }
-            EntryKind::GitTree { children: None, .. } => match self.fill_children(parent.into()) {
+            EntryKind::DirtyDir {
+                children: Some(children),
+            } => {
+                let child = *some!(children.get(name), reply, ENOENT);
+                let child_entry = some!(self.inomap.get(child), reply, ENOENT);
+                return reply.entry(&Self::ttl(), &self.make_attr(child, child_entry), 0);
+            }
+            EntryKind::GitTree { children: None, .. } => match self.do_opendir(parent.into()) {
+                Ok(_) => (),
+                Err(e) => return reply.error(e),
+            },
+            EntryKind::DirtyDir { children: None, .. } => match self.do_opendir(parent.into()) {
                 Ok(_) => (),
                 Err(e) => return reply.error(e),
             },
@@ -112,7 +115,18 @@ impl Filesystem for GitFS {
                 let child_entry = some!(self.inomap.get(child), reply, ENOENT);
                 return reply.entry(&Self::ttl(), &self.make_attr(child, child_entry), 0);
             }
+            EntryKind::DirtyDir {
+                children: Some(children),
+            } => {
+                let child = *some!(children.get(name), reply, ENOENT);
+                let child_entry = some!(self.inomap.get(child), reply, ENOENT);
+                return reply.entry(&Self::ttl(), &self.make_attr(child, child_entry), 0);
+            }
             EntryKind::GitTree { children: None, .. } => {
+                warn!("children is empty after fill, skipping");
+                return reply.error(ENOENT);
+            }
+            EntryKind::DirtyDir { children: None, .. } => {
                 warn!("children is empty after fill, skipping");
                 return reply.error(ENOENT);
             }
@@ -128,7 +142,7 @@ impl Filesystem for GitFS {
 
     fn opendir(&mut self, _req: &Request, ino: u64, _flags: u32, reply: ReplyOpen) {
         let ino = Ino::from(ino);
-        match self.fill_children(ino) {
+        match self.do_opendir(ino) {
             Ok(_) => reply.opened(0, 0),
             Err(e) => reply.error(e),
         }
@@ -157,12 +171,158 @@ impl Filesystem for GitFS {
                 }
                 return reply.ok();
             }
-            EntryKind::GitTree { children: None, .. } => {
+            EntryKind::DirtyDir {
+                children: Some(children),
+            } => {
+                dbg!(&children);
+                dbg!(offset);
+                for (i, (name, &child)) in children.iter().enumerate().skip(offset as usize) {
+                    println!("{:?} {:?}", Ino::from(child), name);
+                    if reply.add(child.into(), (i + 1) as i64, entry.into(), name) {
+                        return reply.ok();
+                    }
+                }
+                return reply.ok();
+            }
+            _ => {
                 // readdir cannot be called before opendir
                 unreachable!()
             }
-            EntryKind::DirtyDir { .. } => unimplemented!(),
         }
+    }
+
+    fn releasedir(&mut self, _req: &Request, ino: u64, _fh: u64, _flags: u32, reply: ReplyEmpty) {
+        let ino = Ino::from(ino);
+        let entry = some!(self.inomap.get_mut(ino), reply, ENOENT);
+        match entry.u {
+            EntryKind::DirtyFile { .. } | EntryKind::GitBlob { .. } => return reply.error(ENOTDIR),
+            EntryKind::GitTree { .. } | EntryKind::DirtyDir { .. } => (),
+        }
+        return reply.ok();
+    }
+
+    fn open(&mut self, _req: &Request, ino: u64, flags: u32, reply: ReplyOpen) {
+        dbg!(flags);
+        let flags = flags as i32;
+        let ino = Ino::from(ino);
+        let entry = some!(self.inomap.get_mut(ino), reply, ENOENT);
+        match entry.u {
+            EntryKind::GitTree { .. } | EntryKind::DirtyDir { .. } => return reply.error(EISDIR),
+            EntryKind::DirtyFile {
+                file: Some(_),
+                ref mut refcnt,
+            } => {
+                *refcnt += 1;
+            }
+            EntryKind::DirtyFile {
+                file: None,
+                ref mut refcnt,
+            } => {
+                *refcnt = 1;
+                let path = self.inomap.prefix(ino).unwrap();
+                debug!("Open dirty file {:?}", path);
+                io_ok!(self.open_dirty_file(ino), reply);
+                return reply.opened(0, 0);
+            }
+            EntryKind::GitBlob { .. } if flags & !O_RDONLY == 0 => {
+                return reply.opened(0, 0);
+            }
+            EntryKind::GitBlob { oid } => {
+                io_ok!(self.open_git_blob_for_update(oid, ino), reply);
+                return reply.opened(0, 0);
+            }
+        }
+    }
+
+    fn read(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        size: u32,
+        reply: ReplyData,
+    ) {
+        let entry = some!(self.inomap.get_mut(ino.into()), reply, ENOENT);
+        let offset = offset as usize;
+        let size = size as usize;
+        match &mut entry.u {
+            EntryKind::GitBlob { oid, .. } => {
+                let blob = self.repo.find_blob(*oid).unwrap();
+                return reply.data(&blob.content()[offset..offset + size]);
+            }
+            EntryKind::DirtyFile { file, .. } => {
+                if file.is_none() {
+                    warn!("read closed file!");
+                    return reply.error(libc::EIO);
+                }
+                let file = file.as_mut().unwrap();
+                let mut buf = vec![0; size];
+                io_ok!(file.seek(SeekFrom::Start(offset as u64)), reply);
+                let nbytes = io_ok!(file.read(&mut buf), reply);
+                return reply.data(&buf[0..nbytes]);
+            }
+            EntryKind::GitTree { .. } | EntryKind::DirtyDir { .. } => return reply.error(EISDIR),
+        }
+    }
+
+    fn write(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        data: &[u8],
+        _flags: u32,
+        reply: ReplyWrite,
+    ) {
+        let ino = Ino::from(ino);
+        let entry = some!(self.inomap.get_mut(ino), reply, ENOENT);
+        match &mut entry.u {
+            EntryKind::GitTree { .. } | EntryKind::DirtyDir { .. } => return reply.error(EISDIR),
+            EntryKind::DirtyFile {
+                file: Some(ref mut file),
+                ..
+            } => {
+                io_ok!(file.seek(SeekFrom::Start(offset as u64)), reply);
+                let nbytes = io_ok!(file.write(data), reply);
+                reply.written(nbytes as u32);
+            }
+            _ => {
+                // 1. We should have already replaced all GitBlob with DirtyFile
+                // 2. Such files must have been opened for writing
+                unreachable!()
+            }
+        }
+    }
+
+    fn release(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        _flags: u32,
+        _lock_owner: u64,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        let ino = Ino::from(ino);
+        let entry = some!(self.inomap.get_mut(ino), reply, ENOENT);
+        match entry.u {
+            EntryKind::DirtyDir { .. } | EntryKind::GitTree { .. } => return reply.error(EISDIR),
+            EntryKind::GitBlob { .. } => (),
+            EntryKind::DirtyFile {
+                ref mut file,
+                ref mut refcnt,
+            } => {
+                *refcnt -= 1;
+                if *refcnt <= 0 {
+                    *refcnt = 0;
+                    *file = None;
+                }
+            }
+        }
+        return reply.ok();
     }
 }
 
@@ -197,37 +357,85 @@ impl GitFS {
         }
     }
 
-    /// Fill the `children` field of `Entry::Directory`.
-    fn fill_children(&mut self, ino: Ino) -> Result<(), c_int> {
+    fn open_dirty_file(&mut self, ino: Ino) -> Result<(), io::Error> {
+        let path = self.inomap.prefix(ino).unwrap();
+        let entry = self.inomap.get_mut(ino).unwrap();
+        let f = self
+            .underlying_dir
+            .update_file(&path, entry.perm.mode() as u16)?;
+        entry.u = EntryKind::DirtyFile {
+            file: Some(f),
+            refcnt: 1,
+        };
+        Ok(())
+    }
+
+    fn open_git_blob_for_update(&mut self, oid: Oid, ino: Ino) -> Result<(), io::Error> {
+        // checkout git blob
+        let path = self.inomap.prefix(ino).unwrap();
+        let blob = self.repo.find_blob(oid).unwrap();
+        let entry = self.inomap.get_mut(ino).unwrap();
+        let mut f = self
+            .underlying_dir
+            .update_file(&path, entry.perm.mode() as u16)?;
+        f.write_all(blob.content())?;
+
+        // replace git blob entry with a dirty file entry
+        entry.u = EntryKind::DirtyFile {
+            file: Some(f),
+            refcnt: 1,
+        };
+
+        Ok(())
+    }
+
+    /// List a GitTree or open a dirty dir.
+    fn do_opendir(&mut self, ino: Ino) -> Result<(), c_int> {
         let dir_entry = self.inomap.get(ino).ok_or(ENOENT)?;
 
-        // we treat directories specially becausedir_entry points to
+        // Step1: check if has been listed. if so, return early;
+        // otherwise, list the dir.
+        //
+        // We treat directories specially, because dir_entry points to
         // inomap, but inomap should stay unchanged during our walk.
         let walk;
         match dir_entry.u {
+            EntryKind::DirtyDir { children: Some(_) } => return Ok(()),
+            EntryKind::GitTree {
+                children: Some(_), ..
+            } => return Ok(()),
             EntryKind::GitTree {
                 oid,
                 children: None,
                 ..
             } => {
-                walk = self.walk_tree(ino, oid).map_err(|_| ENOENT)?;
+                walk = self.walk_dir(ino, Some(oid))?;
             }
-            EntryKind::GitTree {
-                children: Some(_), ..
-            } => return Ok(()),
+            EntryKind::DirtyDir { children: None, .. } => {
+                walk = self.walk_dir(ino, None)?;
+            }
             _ => return Err(ENOTDIR),
         }
+        dbg!(&walk);
 
-        // walk done, insert data to inomap so that we have inos
+        // Step2: walk done, insert data to inomap so that we have inos
         let children_entries = walk
             .into_iter()
             .map(|(name, entry)| (name, self.inomap.add(entry)))
             .collect::<HashMap<OsString, Ino>>();
+        dbg!(&children_entries);
 
-        // lookup dir_entry again in case it's moved
+        // Step3: lookup dir_entry again in case it's moved
         let dir_entry = self.inomap.get_mut(ino).ok_or(ENOENT)?;
         match dir_entry.u {
             EntryKind::GitTree {
+                children: ref mut c @ None,
+                ..
+            } => {
+                c.replace(children_entries);
+                return Ok(());
+            }
+            EntryKind::DirtyDir {
                 children: ref mut c @ None,
                 ..
             } => {
@@ -238,19 +446,16 @@ impl GitFS {
         }
     }
 
-    fn walk_tree(&self, ino: Ino, tree_id: Oid) -> Result<(Vec<(OsString, Entry)>), GitError> {
+    fn walk_tree(&self, ino: Ino, tree_id: Oid) -> Result<(HashMap<OsString, Entry>), GitError> {
         let tree = self.repo.find_tree(tree_id)?;
-        let mut entries = Vec::new();
+        let mut entries = HashMap::new();
 
         for tree_entry in tree.iter() {
             let name = OsString::from(OsStr::from_bytes(tree_entry.name_bytes()));
             let perm = Permissions::from_mode(tree_entry.filemode() as u32);
             let entry = match tree_entry.kind() {
                 Some(ObjectType::Blob) => {
-                    // FIXME: can this fail?
-                    let blob = self.repo.find_blob(tree_entry.id()).unwrap();
-
-                    // TODO: dirty files
+                    let blob = self.repo.find_blob(tree_entry.id())?;
                     Entry {
                         name: name.clone(),
                         parent: ino,
@@ -268,7 +473,7 @@ impl GitFS {
                 Some(ObjectType::Tree) => Entry {
                     parent: ino,
                     name: name.clone(),
-                    perm: Permissions::from_mode(0o755),  // tree doesn't have a proper mode
+                    perm: Permissions::from_mode(0o755), // tree doesn't have a proper mode
                     size: 0,
                     ctime: Timespec::new(0, 0),
                     atime: Timespec::new(0, 0),
@@ -288,8 +493,113 @@ impl GitFS {
                     continue;
                 }
             };
-            entries.push((name, entry));
+            entries.insert(name, entry);
         }
+        Ok(entries)
+    }
+
+    /// If tree_id is None, then the directory is considered a dirty
+    /// dir. All files and dirs under a dirty dir are dirty.
+    /// Of course, it can be recursive, but laziness is a virtue.
+    fn walk_dir(
+        &self,
+        ino: Ino,
+        tree_id: Option<Oid>,
+    ) -> Result<(HashMap<OsString, Entry>), c_int> {
+        let mut entries = match tree_id {
+            Some(tree_id) => self.walk_tree(ino, tree_id).map_err(|_| ENOENT)?,
+            None => HashMap::new(),
+        };
+
+        // look at underlying_dir/prefix
+        let prefix = self.inomap.prefix(ino).unwrap();
+        let dir_iter = if ino.is_root() {
+            self.underlying_dir.list_self()
+        } else {
+            self.underlying_dir.list_dir(prefix.as_os_str())
+        };
+
+        if dir_iter.is_err() && tree_id.is_some() {
+            // git tree doesn't have a ghost dir, return early
+            return Ok(entries);
+        } else if dir_iter.is_err() && tree_id.is_none() {
+            // error inside dirty dir
+            return Err(EIO);
+        }
+        let dir_iter = dir_iter.unwrap();
+
+        // try to collect dirty entries
+        for dirty_entry in dir_iter {
+            if dirty_entry.is_err() {
+                warn!("a dirty entry cannot be read, skipping");
+                continue;
+            }
+
+            let dirty_entry = dirty_entry.unwrap();
+            let mut path = prefix.clone();
+            path.push(dirty_entry.file_name());
+            let metadata = match self.underlying_dir.metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(e) => {
+                    warn!("metadata of a dirty entry cannot be read {}, skipping", e);
+                    continue;
+                }
+            };
+            let stat = metadata.stat();
+            match dirty_entry.simple_type() {
+                Some(SimpleType::Dir) => {
+                    println!("found dir: {:?}", dirty_entry.file_name());
+                    // a dir is dirty <=> it's on disk but not in git tree
+                    if !entries.contains_key(dirty_entry.file_name()) {
+                        let name = dirty_entry.file_name().to_owned();
+                        entries.insert(
+                            name.clone(),
+                            Entry {
+                                name: name,
+                                parent: ino,
+                                perm: Permissions::from_mode(stat.st_mode as u32),
+                                size: stat.st_size as usize,
+                                atime: Timespec::new(stat.st_atime, stat.st_atime_nsec as i32),
+                                mtime: Timespec::new(stat.st_mtime, stat.st_mtime_nsec as i32),
+                                ctime: Timespec::new(stat.st_ctime, stat.st_ctime_nsec as i32),
+                                crtime: Timespec::new(
+                                    stat.st_birthtime,
+                                    stat.st_birthtime_nsec as i32,
+                                ),
+                                u: EntryKind::DirtyDir { children: None },
+                            },
+                        );
+                    }
+                }
+                Some(SimpleType::File) => {
+                    // a file on disk is always considered dirty
+                    println!("found file: {:?}", dirty_entry.file_name());
+                    let name = dirty_entry.file_name().to_owned();
+                    entries.insert(
+                        name.clone(),
+                        Entry {
+                            name: name,
+                            parent: ino,
+                            perm: Permissions::from_mode(stat.st_mode as u32),
+                            size: stat.st_size as usize,
+                            atime: Timespec::new(stat.st_atime, stat.st_atime_nsec as i32),
+                            mtime: Timespec::new(stat.st_mtime, stat.st_mtime_nsec as i32),
+                            ctime: Timespec::new(stat.st_ctime, stat.st_ctime_nsec as i32),
+                            crtime: Timespec::new(stat.st_birthtime, stat.st_birthtime_nsec as i32),
+                            u: EntryKind::DirtyFile {
+                                file: None,
+                                refcnt: 0,
+                            },
+                        },
+                    );
+                }
+                _ => {
+                    warn!("unknown file type, skipping");
+                    continue;
+                }
+            }
+        }
+
         Ok(entries)
     }
 

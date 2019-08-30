@@ -3,10 +3,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ops::AddAssign;
 use std::fs::{File, Permissions};
-use std::rc::Rc;
+use std::path::PathBuf;
 use std::ffi::OsString;
 
-use openat::Dir;
 use git2::Oid;
 use time::Timespec;
 use fuse::FileType;
@@ -22,6 +21,10 @@ pub struct Ino(u64);
 
 impl Ino {
     const ROOT: Ino = Ino(1);
+
+    fn is_root(self) -> bool {
+        return self == Self::ROOT
+    }
 }
 
 impl From<u64> for Ino {
@@ -73,15 +76,31 @@ impl InoMap {
     fn get_mut(&mut self, ino: Ino) -> Option<&mut Entry> {
         self.inner.get_mut(&ino)
     }
+
+    /// Return a fs prefix as PathBuf.
+    fn prefix(&self, mut ino: Ino) -> Option<PathBuf> {
+        let mut parts = vec![];
+        while !ino.is_root() {
+            let entry = self.get(ino)?;
+            parts.push(entry.name.clone());
+            ino = entry.parent;
+        }
+
+        let mut prefix = PathBuf::new();
+        for part in parts.iter().rev() {
+            prefix.push(part);
+        }
+        println!("prefix: {:?}", prefix);
+        Some(prefix)
+    }
 }
 
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Entry {
     name: OsString,
 
     /// root.parent == root.
-    /// FIXME: is it really needed?
     parent: Ino,
 
     /// File status changed.
@@ -106,7 +125,7 @@ struct Entry {
     u: EntryKind,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum EntryKind {
     GitTree {
         /// an OID pointing to the tree object
@@ -120,12 +139,12 @@ pub enum EntryKind {
         oid: Oid,
     },
     DirtyDir {
-        /// The actual directory on disk.
-        dir: Rc<Dir>,
+        children: Option<HashMap<OsString, Ino>>,
     },
     DirtyFile {
+        refcnt: i32,
         /// The actual file on disk.
-        file: Rc<File>,
+        file: Option<File>,
     },
 }
 
