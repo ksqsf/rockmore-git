@@ -21,7 +21,7 @@ use libc::{c_int, EISDIR, ENOENT, ENOTDIR};
 use openat::Dir;
 use std::collections::HashMap;
 
-use crate::{Entry, Ino, InoMap};
+use crate::{Entry, EntryKind, Ino, InoMap};
 
 macro_rules! some {
     ($value:expr, $reply:ident, $errno:expr) => {
@@ -72,20 +72,20 @@ impl Filesystem for GitFS {
         let entry = some!(self.inomap.get(ino.into()), reply, ENOENT);
         let offset = offset as usize;
         let size = size as usize;
-        match entry {
-            Entry::CleanFile { oid, .. } => {
-                let blob = self.repo.find_blob(*oid).unwrap();
+        match entry.u {
+            EntryKind::GitBlob { oid, .. } => {
+                let blob = self.repo.find_blob(oid).unwrap();
                 return reply.data(&blob.content()[offset..offset + size]);
             }
-            Entry::DirtyFile { .. } => unimplemented!(),
-            Entry::Directory { .. } => return reply.error(EISDIR),
+            EntryKind::DirtyFile { .. } => unimplemented!(),
+            EntryKind::GitTree { .. } | EntryKind::DirtyDir { .. } => return reply.error(EISDIR),
         }
     }
 
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let parent_entry = some!(self.inomap.get(parent.into()), reply, ENOENT);
-        match parent_entry {
-            Entry::Directory {
+        match &parent_entry.u {
+            EntryKind::GitTree {
                 children: Some(children),
                 ..
             } => {
@@ -93,7 +93,7 @@ impl Filesystem for GitFS {
                 let child_entry = some!(self.inomap.get(child), reply, ENOENT);
                 return reply.entry(&Self::ttl(), &self.make_attr(child, child_entry), 0);
             }
-            Entry::Directory { children: None, .. } => match self.fill_children(parent.into()) {
+            EntryKind::GitTree { children: None, .. } => match self.fill_children(parent.into()) {
                 Ok(_) => (),
                 Err(e) => return reply.error(e),
             },
@@ -103,8 +103,8 @@ impl Filesystem for GitFS {
         // if we reachabled here, it means we have filled children of
         // a directory
         let parent_entry = some!(self.inomap.get(parent.into()), reply, ENOENT);
-        match parent_entry {
-            Entry::Directory {
+        match &parent_entry.u {
+            EntryKind::GitTree {
                 children: Some(children),
                 ..
             } => {
@@ -112,7 +112,7 @@ impl Filesystem for GitFS {
                 let child_entry = some!(self.inomap.get(child), reply, ENOENT);
                 return reply.entry(&Self::ttl(), &self.make_attr(child, child_entry), 0);
             }
-            Entry::Directory { children: None, .. } => {
+            EntryKind::GitTree { children: None, .. } => {
                 warn!("children is empty after fill, skipping");
                 return reply.error(ENOENT);
             }
@@ -144,9 +144,9 @@ impl Filesystem for GitFS {
     ) {
         let ino = Ino::from(ino);
         let entry = some!(self.inomap.get(ino), reply, ENOENT);
-        match entry {
-            Entry::CleanFile { .. } | Entry::DirtyFile { .. } => return reply.error(ENOTDIR),
-            Entry::Directory {
+        match &entry.u {
+            EntryKind::GitBlob { .. } | EntryKind::DirtyFile { .. } => return reply.error(ENOTDIR),
+            EntryKind::GitTree {
                 children: Some(children),
                 ..
             } => {
@@ -157,10 +157,11 @@ impl Filesystem for GitFS {
                 }
                 return reply.ok();
             }
-            Entry::Directory { children: None, .. } => {
+            EntryKind::GitTree { children: None, .. } => {
                 // readdir cannot be called before opendir
                 unreachable!()
             }
+            EntryKind::DirtyDir { .. } => unimplemented!(),
         }
     }
 }
@@ -180,14 +181,19 @@ impl GitFS {
         let mtime = Timespec::new(stat.st_mtime, stat.st_mtime_nsec as i32);
         let ctime = Timespec::new(stat.st_ctime, stat.st_ctime_nsec as i32);
         let crtime = Timespec::new(stat.st_birthtime, stat.st_birthtime_nsec as i32);
-        Entry::Directory {
-            oid: tree.id(),
+        Entry {
             name: "".to_string().into(),
+            parent: Ino::ROOT,
+            size: 0,
             atime,
             ctime,
             mtime,
             crtime,
-            children: None,
+            perm: metadata.permissions(),
+            u: EntryKind::GitTree {
+                oid: tree.id(),
+                children: None,
+            },
         }
     }
 
@@ -198,15 +204,15 @@ impl GitFS {
         // we treat directories specially becausedir_entry points to
         // inomap, but inomap should stay unchanged during our walk.
         let walk;
-        match dir_entry {
-            Entry::Directory {
+        match dir_entry.u {
+            EntryKind::GitTree {
                 oid,
                 children: None,
                 ..
             } => {
-                walk = self.walk_tree(ino, *oid).map_err(|_| ENOENT)?;
+                walk = self.walk_tree(ino, oid).map_err(|_| ENOENT)?;
             }
-            Entry::Directory {
+            EntryKind::GitTree {
                 children: Some(_), ..
             } => return Ok(()),
             _ => return Err(ENOTDIR),
@@ -220,8 +226,8 @@ impl GitFS {
 
         // lookup dir_entry again in case it's moved
         let dir_entry = self.inomap.get_mut(ino).ok_or(ENOENT)?;
-        match dir_entry {
-            Entry::Directory {
+        match dir_entry.u {
+            EntryKind::GitTree {
                 children: ref mut c @ None,
                 ..
             } => {
@@ -245,24 +251,33 @@ impl GitFS {
                     let blob = self.repo.find_blob(tree_entry.id()).unwrap();
 
                     // TODO: dirty files
-                    Entry::CleanFile {
-                        oid: tree_entry.id(),
+                    Entry {
+                        name: name.clone(),
+                        parent: ino,
                         size: blob.size(),
                         perm,
-                        parent: ino,
                         ctime: Timespec::new(0, 0),
                         atime: Timespec::new(0, 0),
                         mtime: Timespec::new(0, 0),
+                        crtime: Timespec::new(0, 0),
+                        u: EntryKind::GitBlob {
+                            oid: tree_entry.id(),
+                        },
                     }
                 }
-                Some(ObjectType::Tree) => Entry::Directory {
-                    oid: tree_entry.id(),
+                Some(ObjectType::Tree) => Entry {
+                    parent: ino,
                     name: name.clone(),
+                    perm: Permissions::from_mode(0o755),  // tree doesn't have a proper mode
+                    size: 0,
                     ctime: Timespec::new(0, 0),
                     atime: Timespec::new(0, 0),
                     mtime: Timespec::new(0, 0),
                     crtime: Timespec::new(0, 0),
-                    children: None,
+                    u: EntryKind::GitTree {
+                        oid: tree_entry.id(),
+                        children: None,
+                    },
                 },
                 _ => {
                     warn!(
@@ -279,70 +294,25 @@ impl GitFS {
     }
 
     fn make_attr(&self, ino: Ino, entry: &Entry) -> FileAttr {
-        match entry {
-            Entry::Directory { .. } => self.make_dir_attr(ino, entry),
-            Entry::CleanFile { .. } => self.make_clean_file_attr(ino, entry),
-            Entry::DirtyFile { .. } => self.make_dirty_file_attr(ino, entry),
-        }
-    }
-
-    fn make_dir_attr(&self, ino: Ino, entry: &Entry) -> FileAttr {
-        match entry {
-            Entry::Directory {
-                atime,
-                ctime,
-                mtime,
-                crtime,
-                ..
-            } => {
-                FileAttr {
-                    ino: ino.into(),
-                    size: 0,
-                    blocks: 0,
-                    atime: *atime,
-                    mtime: *mtime,
-                    ctime: *ctime,
-                    crtime: *crtime,
-                    kind: FileType::Directory,
-                    perm: 0o755,
-                    nlink: 2,
-                    uid: unsafe { libc::getuid() },
-                    gid: unsafe { libc::getgid() },
-                    rdev: 0,
-                    flags: 0,
-                }
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    fn make_dirty_file_attr(&self, _ino: Ino, _entry: &Entry) -> FileAttr {
-        unimplemented!()
-    }
-
-    fn make_clean_file_attr(&self, ino: Ino, entry: &Entry) -> FileAttr {
-        match entry {
-            Entry::CleanFile {
-                perm, size, ..
-            } => {
-                FileAttr {
-                    ino: ino.into(),
-                    size: *size as u64,
-                    blocks: 0,
-                    atime: Timespec::new(0, 0),
-                    mtime: Timespec::new(0, 0),
-                    ctime: Timespec::new(0, 0),
-                    crtime: Timespec::new(0, 0),
-                    kind: FileType::RegularFile,
-                    perm: perm.mode() as u16,
-                    nlink: 1,
-                    uid: unsafe { libc::getuid() },
-                    gid: unsafe { libc::getgid() },
-                    rdev: 0,
-                    flags: 0,
-                }
-            }
-            _ => unreachable!(),
+        FileAttr {
+            ino: ino.into(),
+            size: entry.size as u64,
+            blocks: 0,
+            atime: entry.atime,
+            mtime: entry.mtime,
+            ctime: entry.ctime,
+            crtime: entry.crtime,
+            kind: FileType::from(entry),
+            perm: entry.perm.mode() as u16,
+            nlink: if FileType::from(entry) == FileType::Directory {
+                2
+            } else {
+                1
+            },
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            rdev: 0,
+            flags: 0,
         }
     }
 }

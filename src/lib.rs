@@ -6,6 +6,7 @@ use std::fs::{File, Permissions};
 use std::rc::Rc;
 use std::ffi::OsString;
 
+use openat::Dir;
 use git2::Oid;
 use time::Timespec;
 use fuse::FileType;
@@ -76,30 +77,51 @@ impl InoMap {
 
 
 #[derive(Debug, Clone)]
-pub enum Entry {
-    Directory {
+struct Entry {
+    name: OsString,
+
+    /// root.parent == root.
+    /// FIXME: is it really needed?
+    parent: Ino,
+
+    /// File status changed.
+    ctime: Timespec,
+
+    /// Last accessed.
+    atime: Timespec,
+
+    /// Data modified.
+    mtime: Timespec,
+
+    /// Created.
+    crtime: Timespec,
+
+    /// Permission bits.
+    perm: Permissions,
+
+    /// Size.
+    size: usize,
+
+    /// Entry kind.
+    u: EntryKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum EntryKind {
+    GitTree {
         /// an OID pointing to the tree object
         oid: Oid,
-        /// The name of root (toplevel) is an empty string.
-        name: OsString,
-        ctime: Timespec,
-        atime: Timespec,
-        mtime: Timespec,
-        crtime: Timespec,
         /// Files under this directory.
         /// None means the tree is not traversed.
-        /// `opendir` will set it to Some.
         children: Option<HashMap<OsString, Ino>>,
     },
-    CleanFile {
+    GitBlob {
         /// an OID pointing to the blob object
         oid: Oid,
-        parent: Ino,
-        size: usize,
-        perm: Permissions,
-        ctime: Timespec,
-        atime: Timespec,
-        mtime: Timespec,
+    },
+    DirtyDir {
+        /// The actual directory on disk.
+        dir: Rc<Dir>,
     },
     DirtyFile {
         /// The actual file on disk.
@@ -109,9 +131,9 @@ pub enum Entry {
 
 impl From<&Entry> for FileType {
     fn from(x: &Entry) -> FileType {
-        match x {
-            Entry::Directory { .. } => FileType::Directory,
-            Entry::CleanFile { .. } | Entry::DirtyFile { .. } => FileType::RegularFile,
+        match x.u {
+            EntryKind::GitTree { .. } | EntryKind::DirtyDir { .. } => FileType::Directory,
+            EntryKind::GitBlob { .. } | EntryKind::DirtyFile { .. } => FileType::RegularFile,
         }
     }
 }
