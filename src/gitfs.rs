@@ -306,8 +306,8 @@ impl GitFS {
                     kind: FileType::Directory,
                     perm: 0o755,
                     nlink: 2,
-                    uid: 501, // FIXME
-                    gid: 20,  // FIXME
+                    uid: unsafe { libc::getuid() },
+                    gid: unsafe { libc::getgid() },
                     rdev: 0,
                     flags: 0,
                 }
@@ -336,8 +336,8 @@ impl GitFS {
                     kind: FileType::RegularFile,
                     perm: perm.mode() as u16,
                     nlink: 1,
-                    uid: 501,
-                    gid: 20,
+                    uid: unsafe { libc::getuid() },
+                    gid: unsafe { libc::getgid() },
                     rdev: 0,
                     flags: 0,
                 }
