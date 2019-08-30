@@ -16,8 +16,8 @@ use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
 use time::Timespec;
 
 use fuse::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyWrite, Request,
+    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 use git2::{Error as GitError, ObjectType, Oid, Repository, Tree};
 use libc::{c_int, EIO, EISDIR, ENOENT, ENOTDIR, O_RDONLY};
@@ -323,6 +323,89 @@ impl Filesystem for GitFS {
             }
         }
         return reply.ok();
+    }
+
+    fn create(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _flags: u32,
+        reply: ReplyCreate,
+    ) {
+        let path = {
+            let mut p = some!(self.inomap.prefix(Ino::from(parent)), reply, EIO);
+            p.push(name);
+            p
+        };
+        let _file = io_ok!(self.underlying_dir.write_file(&path, mode as u16), reply);
+        let fentry = Entry {
+            name: name.to_owned(),
+            parent: Ino::from(parent),
+            ctime: time::now().to_timespec(),
+            mtime: time::now().to_timespec(),
+            atime: time::now().to_timespec(),
+            crtime: time::now().to_timespec(),
+            perm: Permissions::from_mode(mode),
+            size: 0,
+            u: EntryKind::DirtyFile {
+                refcnt: 0,
+                file: None,
+            },
+        };
+        let attr = self.make_attr(self.inomap.next_ino(), &fentry);
+        let ino = self.inomap.add(fentry);
+        let dir = some!(self.inomap.get_mut(Ino::from(parent)), reply, ENOENT);
+        let children = match &mut dir.u {
+            EntryKind::GitTree {
+                children: Some(ref mut c),
+                ..
+            } => c,
+            EntryKind::DirtyDir {
+                children: Some(ref mut c),
+                ..
+            } => c,
+            _ => unreachable!(),
+        };
+        children.insert(name.to_owned(), ino);
+        reply.created(&Self::ttl(), &attr, 0, 0, 0)
+    }
+
+    fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, mode: u32, reply: ReplyEntry) {
+        let path = {
+            let mut p = some!(self.inomap.prefix(Ino::from(parent)), reply, EIO);
+            p.push(name);
+            p
+        };
+        io_ok!(self.underlying_dir.create_dir(&path, mode as u16), reply);
+        let dentry = Entry {
+            name: name.to_owned(),
+            parent: Ino::from(parent),
+            ctime: time::now().to_timespec(),
+            mtime: time::now().to_timespec(),
+            atime: time::now().to_timespec(),
+            crtime: time::now().to_timespec(),
+            perm: Permissions::from_mode(mode),
+            size: 0,
+            u: EntryKind::DirtyDir { children: None },
+        };
+        let attr = self.make_attr(self.inomap.next_ino(), &dentry);
+        let ino = self.inomap.add(dentry);
+        let dir = some!(self.inomap.get_mut(Ino::from(parent)), reply, ENOENT);
+        let children = match &mut dir.u {
+            EntryKind::GitTree {
+                children: Some(ref mut c),
+                ..
+            } => c,
+            EntryKind::DirtyDir {
+                children: Some(ref mut c),
+                ..
+            } => c,
+            _ => unreachable!(),
+        };
+        children.insert(name.to_owned(), ino);
+        reply.entry(&Self::ttl(), &attr, 0);
     }
 }
 

@@ -77,6 +77,10 @@ impl InoMap {
         self.inner.get_mut(&ino)
     }
 
+    fn next_ino(&self) -> Ino {
+        self.next_ino
+    }
+
     /// Return a fs prefix as PathBuf.
     fn prefix(&self, mut ino: Ino) -> Option<PathBuf> {
         let mut parts = vec![];
