@@ -14,7 +14,6 @@ use fuse::FileType;
 extern crate log;
 
 pub mod gitfs;
-pub mod macros;
 
 
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
@@ -76,7 +75,6 @@ impl InoMap {
 }
 
 
-// TODO: ghost dirs
 #[derive(Debug, Clone)]
 pub enum Entry {
     Directory {
@@ -87,6 +85,7 @@ pub enum Entry {
         ctime: Timespec,
         atime: Timespec,
         mtime: Timespec,
+        crtime: Timespec,
         /// Files under this directory.
         /// None means the tree is not traversed.
         /// `opendir` will set it to Some.

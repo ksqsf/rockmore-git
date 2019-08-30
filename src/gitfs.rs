@@ -55,10 +55,6 @@ impl Filesystem for GitFS {
     fn init(&mut self, _req: &Request) -> Result<(), c_int> {
         let commit = self.repo.head().unwrap().peel_to_commit().unwrap();
         let tree = commit.tree().unwrap();
-        info!("3");
-        // let a = self.underlying_dir.metadata(".").unwrap();
-        // info!("metadata ok");
-        // dbg!(a.permissions());
         self.inomap.add(self.root_entry(tree));
         info!("gitfs is mounted");
         Ok(())
@@ -178,14 +174,19 @@ impl GitFS {
 
     /// Create the root entry.
     fn root_entry(&self, tree: Tree<'_>) -> Entry {
-        // cannot simply use std::fs because the fs has been mounted.
-        // FIXME: why underlying_dir will cause problems?
+        let metadata = self.underlying_dir.self_metadata().unwrap();
+        let stat = metadata.stat();
+        let atime = Timespec::new(stat.st_atime, stat.st_atime_nsec as i32);
+        let mtime = Timespec::new(stat.st_mtime, stat.st_mtime_nsec as i32);
+        let ctime = Timespec::new(stat.st_ctime, stat.st_ctime_nsec as i32);
+        let crtime = Timespec::new(stat.st_birthtime, stat.st_birthtime_nsec as i32);
         Entry::Directory {
             oid: tree.id(),
             name: "".to_string().into(),
-            atime: Timespec::new(0, 0),
-            ctime: Timespec::new(0, 0),
-            mtime: Timespec::new(0, 0),
+            atime,
+            ctime,
+            mtime,
+            crtime,
             children: None,
         }
     }
@@ -260,6 +261,7 @@ impl GitFS {
                     ctime: Timespec::new(0, 0),
                     atime: Timespec::new(0, 0),
                     mtime: Timespec::new(0, 0),
+                    crtime: Timespec::new(0, 0),
                     children: None,
                 },
                 _ => {
@@ -290,6 +292,7 @@ impl GitFS {
                 atime,
                 ctime,
                 mtime,
+                crtime,
                 ..
             } => {
                 FileAttr {
@@ -299,7 +302,7 @@ impl GitFS {
                     atime: *atime,
                     mtime: *mtime,
                     ctime: *ctime,
-                    crtime: Timespec::new(0, 0),
+                    crtime: *crtime,
                     kind: FileType::Directory,
                     perm: 0o755,
                     nlink: 2,
