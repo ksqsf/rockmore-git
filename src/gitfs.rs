@@ -465,37 +465,11 @@ impl Filesystem for GitFS {
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let parent_entry = some!(self.inomap.get(parent.into()), reply, ENOENT);
-        let child = match parent_entry.u {
-            EntryKind::DirtyDir {
-                children: Some(ref c),
-            } => *some!(c.get(name), reply, ENOENT),
-            EntryKind::GitTree {
-                children: Some(ref c),
-                ..
-            } => *some!(c.get(name), reply, ENOENT),
-            _ => unreachable!(),
-        };
+        self.do_remove(parent.into(), name, reply)
+    }
 
-        match self.do_unlink(child) {
-            Ok(_) => return reply.ok(),
-            Err((entry, err)) => {
-                let ino = self.inomap.add(entry);
-                let parent_entry = self.inomap.get_mut(parent.into()).unwrap();
-                let c = match parent_entry.u {
-                    EntryKind::DirtyDir {
-                        children: Some(ref mut c),
-                    } => c,
-                    EntryKind::GitTree {
-                        children: Some(ref mut c),
-                        ..
-                    } => c,
-                    _ => unreachable!(),
-                };
-                c.insert(name.to_os_string(), ino);
-                return reply.error(err.raw_os_error().unwrap_or(EIO));
-            }
-        }
+    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        self.do_remove(parent.into(), name, reply)
     }
 }
 
@@ -530,10 +504,45 @@ impl GitFS {
         }
     }
 
+    /// Remove a file or a directory.
+    fn do_remove(&mut self, parent: Ino, name: &OsStr, reply: ReplyEmpty) {
+        let parent_entry = some!(self.inomap.get(parent.into()), reply, ENOENT);
+        let child = match parent_entry.u {
+            EntryKind::DirtyDir {
+                children: Some(ref c),
+            } => *some!(c.get(name), reply, ENOENT),
+            EntryKind::GitTree {
+                children: Some(ref c),
+                ..
+            } => *some!(c.get(name), reply, ENOENT),
+            _ => unreachable!(),
+        };
+
+        match self.remove_entry(child) {
+            Ok(_) => return reply.ok(),
+            Err((entry, err)) => {
+                let ino = self.inomap.add(entry);
+                let parent_entry = self.inomap.get_mut(parent.into()).unwrap();
+                let c = match parent_entry.u {
+                    EntryKind::DirtyDir {
+                        children: Some(ref mut c),
+                    } => c,
+                    EntryKind::GitTree {
+                        children: Some(ref mut c),
+                        ..
+                    } => c,
+                    _ => unreachable!(),
+                };
+                c.insert(name.to_os_string(), ino);
+                return reply.error(err.raw_os_error().unwrap_or(EIO));
+            }
+        }
+    }
+
     /// Remove ino from inomap. If the entry fails to be removed
     /// (e.g. cannot delete dirty file on disk), the entry itself is
     /// returned so that it can be inserted.
-    fn do_unlink(&mut self, ino: Ino) -> Result<(), (Entry, io::Error)> {
+    fn remove_entry(&mut self, ino: Ino) -> Result<(), (Entry, io::Error)> {
         let path = self.inomap.prefix(ino).unwrap();
         let mut entry = self.inomap.remove(ino).unwrap();
         match entry.u {
@@ -548,13 +557,17 @@ impl GitFS {
                 }
                 Err(err) => Err((entry, err)),
             },
+            EntryKind::DirtyDir { .. } => match self.underlying_dir.remove_dir(&path) {
+                Ok(_) => Ok(()),
+                Err(err) => Err((entry, err)),
+            },
             EntryKind::GitBlob { .. } => {
                 // TODO: Perhaps we should record such information, so
                 // that when the repo is mounted here, we can restore
                 // the unstaged deletion.
                 return Ok(());
             }
-            _ => unreachable!(),
+            EntryKind::GitTree { .. } => Ok(()),
         }
     }
 
