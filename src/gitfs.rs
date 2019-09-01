@@ -335,6 +335,10 @@ impl Filesystem for GitFS {
         let entry = some!(self.inomap.get_mut(ino), reply, ENOENT);
         match entry.u {
             EntryKind::GitTree { .. } | EntryKind::DirtyDir { .. } => return reply.error(EISDIR),
+            EntryKind::GitBlob { .. } => {
+                // A flush() will be called on read-only files as well.
+                return reply.ok()
+            }
             EntryKind::DirtyFile {
                 file: Some(ref mut f),
                 ..
@@ -343,8 +347,6 @@ impl Filesystem for GitFS {
                 return reply.ok();
             }
             _ => {
-                // 1. clean files are replaced by dirty files
-                // 2. they have been opened for updating
                 unreachable!();
             }
         }
