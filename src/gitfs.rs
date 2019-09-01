@@ -297,6 +297,26 @@ impl Filesystem for GitFS {
         }
     }
 
+    fn flush(&mut self, _req: &Request, ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+        let ino = Ino::from(ino);
+        let entry = some!(self.inomap.get_mut(ino), reply, ENOENT);
+        match entry.u {
+            EntryKind::GitTree { .. } | EntryKind::DirtyDir { .. } => return reply.error(EISDIR),
+            EntryKind::DirtyFile {
+                file: Some(ref mut f),
+                ..
+            } => {
+                io_ok!(f.flush(), reply);
+                return reply.ok();
+            }
+            _ => {
+                // 1. clean files are replaced by dirty files
+                // 2. they have been opened for updating
+                unreachable!();
+            }
+        }
+    }
+
     fn release(
         &mut self,
         _req: &Request,
