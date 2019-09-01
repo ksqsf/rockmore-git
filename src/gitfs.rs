@@ -20,7 +20,7 @@ use fuse::{
     ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 use git2::{Error as GitError, ObjectType, Oid, Repository, Tree};
-use libc::{c_int, EIO, EISDIR, ENOENT, ENOTDIR, O_RDONLY};
+use libc::{c_int, stat, EIO, EISDIR, ENOENT, ENOTDIR, O_RDONLY};
 use openat::{Dir, SimpleType};
 use std::collections::HashMap;
 
@@ -395,7 +395,7 @@ impl Filesystem for GitFS {
             p.push(name);
             p
         };
-        let file = io_ok!(self.underlying_dir.write_file(&path, mode as u16), reply);
+        let file = io_ok!(self.underlying_dir.write_file(&path, mode.into()), reply);
         let fentry = Entry {
             name: name.to_owned(),
             parent: Ino::from(parent),
@@ -434,7 +434,7 @@ impl Filesystem for GitFS {
             p.push(name);
             p
         };
-        io_ok!(self.underlying_dir.create_dir(&path, mode as u16), reply);
+        io_ok!(self.underlying_dir.create_dir(&path, mode.into()), reply);
         let dentry = Entry {
             name: name.to_owned(),
             parent: Ino::from(parent),
@@ -478,7 +478,7 @@ impl Filesystem for GitFS {
         let c = some!(oldpent.get_child(name), reply, ENOENT);
         let cent = some!(self.inomap.get(c), reply, ENOENT);
         let newp = newparent.into();
-        let newpent = some!(self.inomap.get(newp), reply, ENOENT);
+        let _newpent = some!(self.inomap.get(newp), reply, ENOENT);
 
         // Move dirty files/directories physically.
         match cent.u {
@@ -511,6 +511,7 @@ impl GitFS {
     }
 
     /// Create the root entry.
+    #[cfg(target_os = "macos")]
     fn root_entry(&self, tree: Tree<'_>) -> Entry {
         let metadata = self.underlying_dir.self_metadata().unwrap();
         let stat = metadata.stat();
@@ -518,6 +519,30 @@ impl GitFS {
         let mtime = Timespec::new(stat.st_mtime, stat.st_mtime_nsec as i32);
         let ctime = Timespec::new(stat.st_ctime, stat.st_ctime_nsec as i32);
         let crtime = Timespec::new(stat.st_birthtime, stat.st_birthtime_nsec as i32);
+        Entry {
+            name: "".to_string().into(),
+            parent: Ino::ROOT,
+            size: 0,
+            atime,
+            ctime,
+            mtime,
+            crtime,
+            perm: metadata.permissions(),
+            u: EntryKind::GitTree {
+                oid: tree.id(),
+                children: None,
+            },
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn root_entry(&self, tree: Tree<'_>) -> Entry {
+        let metadata = self.underlying_dir.self_metadata().unwrap();
+        let stat = metadata.stat();
+        let atime = Timespec::new(stat.st_atime, stat.st_atime_nsec as i32);
+        let mtime = Timespec::new(stat.st_mtime, stat.st_mtime_nsec as i32);
+        let ctime = Timespec::new(stat.st_ctime, stat.st_ctime_nsec as i32);
+        let crtime = Timespec::new(0, 0);
         Entry {
             name: "".to_string().into(),
             parent: Ino::ROOT,
@@ -606,7 +631,7 @@ impl GitFS {
         let entry = self.inomap.get_mut(ino).unwrap();
         let f = self
             .underlying_dir
-            .update_file(&path, entry.perm.mode() as u16)?;
+            .update_file(&path, entry.perm.mode().into())?;
         entry.u = EntryKind::DirtyFile {
             file: Some(f),
             refcnt: 1,
@@ -621,7 +646,7 @@ impl GitFS {
         let entry = self.inomap.get_mut(ino).unwrap();
         let mut f = self
             .underlying_dir
-            .update_file(&path, entry.perm.mode() as u16)?;
+            .update_file(&path, entry.perm.mode().into())?;
         f.write_all(blob.content())?;
 
         // replace git blob entry with a dirty file entry
@@ -806,10 +831,7 @@ impl GitFS {
                                 atime: Timespec::new(stat.st_atime, stat.st_atime_nsec as i32),
                                 mtime: Timespec::new(stat.st_mtime, stat.st_mtime_nsec as i32),
                                 ctime: Timespec::new(stat.st_ctime, stat.st_ctime_nsec as i32),
-                                crtime: Timespec::new(
-                                    stat.st_birthtime,
-                                    stat.st_birthtime_nsec as i32,
-                                ),
+                                crtime: birthtime(stat),
                                 u: EntryKind::DirtyDir { children: None },
                             },
                         );
@@ -829,7 +851,7 @@ impl GitFS {
                             atime: Timespec::new(stat.st_atime, stat.st_atime_nsec as i32),
                             mtime: Timespec::new(stat.st_mtime, stat.st_mtime_nsec as i32),
                             ctime: Timespec::new(stat.st_ctime, stat.st_ctime_nsec as i32),
-                            crtime: Timespec::new(stat.st_birthtime, stat.st_birthtime_nsec as i32),
+                            crtime: birthtime(stat),
                             u: EntryKind::DirtyFile {
                                 file: None,
                                 refcnt: 0,
@@ -869,4 +891,14 @@ impl GitFS {
             flags: 0,
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn birthtime(stat: &stat) -> Timespec {
+    Timespec::new(stat.st_birthtime, stat.st_birthtime_nsec)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn birthtime(_: &stat) -> Timespec {
+    Timespec::new(0, 0)
 }
