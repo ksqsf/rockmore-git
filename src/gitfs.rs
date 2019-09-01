@@ -162,7 +162,7 @@ impl Filesystem for GitFS {
         // We are just making up numbers to satisfy FUSE.  Git has its
         // own idea of these attributes, so don't take them seriously.
         mode.map(|x| entry.perm = Permissions::from_mode(x));
-        size.map(|x| entry.size = x as usize);
+        size.map(|x| entry.size = x);
         atime.map(|x| entry.atime = x);
         mtime.map(|x| entry.mtime = x);
         crtime.map(|x| entry.crtime = x);
@@ -692,7 +692,7 @@ impl GitFS {
                                 name: name,
                                 parent: ino,
                                 perm: Permissions::from_mode(stat.st_mode as u32),
-                                size: stat.st_size as usize,
+                                size: stat.st_size as u64,
                                 atime: Timespec::new(stat.st_atime, stat.st_atime_nsec as i32),
                                 mtime: Timespec::new(stat.st_mtime, stat.st_mtime_nsec as i32),
                                 ctime: Timespec::new(stat.st_ctime, stat.st_ctime_nsec as i32),
@@ -715,7 +715,7 @@ impl GitFS {
                             name: name,
                             parent: ino,
                             perm: Permissions::from_mode(stat.st_mode as u32),
-                            size: stat.st_size as usize,
+                            size: stat.st_size as u64,
                             atime: Timespec::new(stat.st_atime, stat.st_atime_nsec as i32),
                             mtime: Timespec::new(stat.st_mtime, stat.st_mtime_nsec as i32),
                             ctime: Timespec::new(stat.st_ctime, stat.st_ctime_nsec as i32),
@@ -740,7 +740,7 @@ impl GitFS {
     fn make_attr(ino: Ino, entry: &Entry) -> FileAttr {
         FileAttr {
             ino: ino.into(),
-            size: entry.size as u64,
+            size: entry.size,
             blocks: 0,
             atime: entry.atime,
             mtime: entry.mtime,

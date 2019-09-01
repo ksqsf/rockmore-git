@@ -123,7 +123,7 @@ struct Entry {
     perm: Permissions,
 
     /// Size.
-    size: usize,
+    size: u64,
 
     /// Entry kind.
     u: EntryKind,
