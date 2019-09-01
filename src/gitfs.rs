@@ -337,7 +337,7 @@ impl Filesystem for GitFS {
             EntryKind::GitTree { .. } | EntryKind::DirtyDir { .. } => return reply.error(EISDIR),
             EntryKind::GitBlob { .. } => {
                 // A flush() will be called on read-only files as well.
-                return reply.ok()
+                return reply.ok();
             }
             EntryKind::DirtyFile {
                 file: Some(ref mut f),
@@ -463,6 +463,40 @@ impl Filesystem for GitFS {
         children.insert(name.to_owned(), ino);
         reply.entry(&Self::ttl(), &attr, 0);
     }
+
+    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let parent_entry = some!(self.inomap.get(parent.into()), reply, ENOENT);
+        let child = match parent_entry.u {
+            EntryKind::DirtyDir {
+                children: Some(ref c),
+            } => *some!(c.get(name), reply, ENOENT),
+            EntryKind::GitTree {
+                children: Some(ref c),
+                ..
+            } => *some!(c.get(name), reply, ENOENT),
+            _ => unreachable!(),
+        };
+
+        match self.do_unlink(child) {
+            Ok(_) => return reply.ok(),
+            Err((entry, err)) => {
+                let ino = self.inomap.add(entry);
+                let parent_entry = self.inomap.get_mut(parent.into()).unwrap();
+                let c = match parent_entry.u {
+                    EntryKind::DirtyDir {
+                        children: Some(ref mut c),
+                    } => c,
+                    EntryKind::GitTree {
+                        children: Some(ref mut c),
+                        ..
+                    } => c,
+                    _ => unreachable!(),
+                };
+                c.insert(name.to_os_string(), ino);
+                return reply.error(err.raw_os_error().unwrap_or(EIO));
+            }
+        }
+    }
 }
 
 // private interfaces
@@ -493,6 +527,34 @@ impl GitFS {
                 oid: tree.id(),
                 children: None,
             },
+        }
+    }
+
+    /// Remove ino from inomap. If the entry fails to be removed
+    /// (e.g. cannot delete dirty file on disk), the entry itself is
+    /// returned so that it can be inserted.
+    fn do_unlink(&mut self, ino: Ino) -> Result<(), (Entry, io::Error)> {
+        let path = self.inomap.prefix(ino).unwrap();
+        let mut entry = self.inomap.remove(ino).unwrap();
+        match entry.u {
+            EntryKind::DirtyFile {
+                ref mut refcnt,
+                ref mut file,
+            } => match self.underlying_dir.remove_file(&path) {
+                Ok(_) => {
+                    *refcnt = 0;
+                    let _ = file.take();
+                    Ok(())
+                }
+                Err(err) => Err((entry, err)),
+            },
+            EntryKind::GitBlob { .. } => {
+                // TODO: Perhaps we should record such information, so
+                // that when the repo is mounted here, we can restore
+                // the unstaged deletion.
+                return Ok(());
+            }
+            _ => unreachable!(),
         }
     }
 

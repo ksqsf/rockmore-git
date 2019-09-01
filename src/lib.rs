@@ -77,6 +77,10 @@ impl InoMap {
         self.inner.get_mut(&ino)
     }
 
+    fn remove(&mut self, ino: Ino) -> Option<Entry> {
+        self.inner.remove(&ino)
+    }
+
     fn next_ino(&self) -> Ino {
         self.next_ino
     }
