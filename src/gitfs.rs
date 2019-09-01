@@ -20,7 +20,7 @@ use fuse::{
     ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 use git2::{Error as GitError, ObjectType, Oid, Repository, Tree};
-use libc::{c_int, stat, EIO, EISDIR, ENOENT, ENOTDIR, O_RDONLY};
+use libc::{c_int, mode_t, stat, EIO, EISDIR, ENOENT, ENOTDIR, O_RDONLY};
 use openat::{Dir, SimpleType};
 use std::collections::HashMap;
 
@@ -395,7 +395,7 @@ impl Filesystem for GitFS {
             p.push(name);
             p
         };
-        let file = io_ok!(self.underlying_dir.write_file(&path, mode.into()), reply);
+        let file = io_ok!(self.underlying_dir.write_file(&path, mode as mode_t), reply);
         let fentry = Entry {
             name: name.to_owned(),
             parent: Ino::from(parent),
@@ -434,7 +434,7 @@ impl Filesystem for GitFS {
             p.push(name);
             p
         };
-        io_ok!(self.underlying_dir.create_dir(&path, mode.into()), reply);
+        io_ok!(self.underlying_dir.create_dir(&path, mode as mode_t), reply);
         let dentry = Entry {
             name: name.to_owned(),
             parent: Ino::from(parent),
@@ -472,7 +472,15 @@ impl Filesystem for GitFS {
         self.do_remove(parent.into(), name, reply)
     }
 
-    fn rename(&mut self, _req: &Request, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, reply: ReplyEmpty) {
+    fn rename(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        reply: ReplyEmpty,
+    ) {
         let oldp = parent.into();
         let oldpent = some!(self.inomap.get(oldp), reply, ENOENT);
         let c = some!(oldpent.get_child(name), reply, ENOENT);
@@ -482,7 +490,7 @@ impl Filesystem for GitFS {
 
         // Move dirty files/directories physically.
         match cent.u {
-            EntryKind::DirtyFile {..} | EntryKind::DirtyDir{..} => {
+            EntryKind::DirtyFile { .. } | EntryKind::DirtyDir { .. } => {
                 let oldpath = self.inomap.prefix(c).unwrap();
                 let mut newpath = self.inomap.prefix(newp).unwrap();
                 newpath.push(newname);
@@ -631,7 +639,7 @@ impl GitFS {
         let entry = self.inomap.get_mut(ino).unwrap();
         let f = self
             .underlying_dir
-            .update_file(&path, entry.perm.mode().into())?;
+            .update_file(&path, entry.perm.mode() as mode_t)?;
         entry.u = EntryKind::DirtyFile {
             file: Some(f),
             refcnt: 1,
@@ -646,7 +654,7 @@ impl GitFS {
         let entry = self.inomap.get_mut(ino).unwrap();
         let mut f = self
             .underlying_dir
-            .update_file(&path, entry.perm.mode().into())?;
+            .update_file(&path, entry.perm.mode() as mode_t)?;
         f.write_all(blob.content())?;
 
         // replace git blob entry with a dirty file entry
@@ -895,7 +903,7 @@ impl GitFS {
 
 #[cfg(target_os = "macos")]
 fn birthtime(stat: &stat) -> Timespec {
-    Timespec::new(stat.st_birthtime, stat.st_birthtime_nsec)
+    Timespec::new(stat.st_birthtime, stat.st_birthtime_nsec as i32)
 }
 
 #[cfg(not(target_os = "macos"))]
