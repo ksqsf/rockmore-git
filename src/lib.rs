@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::AddAssign;
 use std::fs::{File, Permissions};
 use std::path::PathBuf;
-use std::ffi::OsString;
+use std::ffi::{OsString, OsStr};
 
 use git2::Oid;
 use time::Timespec;
@@ -154,6 +154,32 @@ pub enum EntryKind {
         /// The actual file on disk.
         file: Option<File>,
     },
+}
+
+impl Entry {
+    fn get_child(&self, name: &OsStr) -> Option<Ino> {
+        match self.u {
+            EntryKind::DirtyDir { children: Some(ref c) } => c.get(name).cloned(),
+            EntryKind::GitTree { children: Some(ref c), .. } => c.get(name).cloned(),
+            _ => unreachable!(),
+        }
+    }
+
+    fn add_child(&mut self, name: OsString, ino: Ino) {
+        match self.u {
+            EntryKind::DirtyDir { children: Some(ref mut c) } => {c.insert(name, ino);}
+            EntryKind::GitTree { children: Some(ref mut c), .. } => {c.insert(name, ino);}
+            _ => unreachable!(),
+        }
+    }
+
+    fn remove_child(&mut self, name: &OsStr) -> Option<Ino> {
+        match self.u {
+            EntryKind::DirtyDir { children: Some(ref mut c) } => c.remove(name),
+            EntryKind::GitTree { children: Some(ref mut c), .. } => c.remove(name),
+            _ => unreachable!(),
+        }
+    }
 }
 
 impl From<&Entry> for FileType {

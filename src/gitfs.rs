@@ -471,6 +471,36 @@ impl Filesystem for GitFS {
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         self.do_remove(parent.into(), name, reply)
     }
+
+    fn rename(&mut self, _req: &Request, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, reply: ReplyEmpty) {
+        let oldp = parent.into();
+        let oldpent = some!(self.inomap.get(oldp), reply, ENOENT);
+        let c = some!(oldpent.get_child(name), reply, ENOENT);
+        let cent = some!(self.inomap.get(c), reply, ENOENT);
+        let newp = newparent.into();
+        let newpent = some!(self.inomap.get(newp), reply, ENOENT);
+
+        // Move dirty files/directories physically.
+        match cent.u {
+            EntryKind::DirtyFile {..} | EntryKind::DirtyDir{..} => {
+                let oldpath = self.inomap.prefix(c).unwrap();
+                let mut newpath = self.inomap.prefix(newp).unwrap();
+                newpath.push(newname);
+                debug!("move {:?} to {:?}", oldpath, newpath);
+                io_ok!(self.underlying_dir.local_rename(&oldpath, &newpath), reply);
+            }
+            _ => (),
+        }
+
+        // Move entry from oldp to newp. Keep ino intact.
+        let cent = self.inomap.get_mut(c).unwrap();
+        cent.name = newname.to_os_string();
+        let oldpent = self.inomap.get_mut(oldp).unwrap();
+        oldpent.remove_child(name).unwrap();
+        let newpent = self.inomap.get_mut(newp).unwrap();
+        newpent.add_child(newname.to_os_string(), c);
+        return reply.ok();
+    }
 }
 
 // private interfaces
