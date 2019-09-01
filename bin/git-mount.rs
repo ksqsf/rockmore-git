@@ -16,7 +16,7 @@ fn main() {
     let repo = Repository::open(repo_path).unwrap();
 
     let fs = GitFS::new(repo, dir);
-    let options = ["-o", "fsname=gitfs"]
+    let options = ["-o", "nonempty", "-o", "fsname=gitfs"]
         .iter()
         .map(|x| x.as_ref())
         .collect::<Vec<&OsStr>>();
