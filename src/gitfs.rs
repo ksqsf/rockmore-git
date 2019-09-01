@@ -12,7 +12,7 @@ use std::fs::Permissions;
 use std::io;
 use std::io::SeekFrom;
 use std::io::{Read, Seek, Write};
-use std::os::unix::{ffi::OsStrExt, fs::{PermissionsExt, MetadataExt}};
+use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
 use time::Timespec;
 
 use fuse::{
@@ -316,7 +316,10 @@ impl Filesystem for GitFS {
             } => {
                 io_ok!(file.seek(SeekFrom::Start(offset as u64)), reply);
                 let nbytes = io_ok!(file.write(data), reply);
-                entry.size = io_ok!(file.metadata(), reply).size() as usize;
+
+                // Maintain size.
+                entry.size = entry.size.max((offset as u64) + (data.len() as u64));
+
                 return reply.written(nbytes as u32);
             }
             _ => {
