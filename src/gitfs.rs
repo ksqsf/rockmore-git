@@ -83,14 +83,14 @@ impl Filesystem for GitFS {
             } => {
                 let child = *some!(children.get(name), reply, ENOENT);
                 let child_entry = some!(self.inomap.get(child), reply, ENOENT);
-                return reply.entry(&Self::ttl(), &self.make_attr(child, child_entry), 0);
+                return reply.entry(&Self::ttl(), &Self::make_attr(child, child_entry), 0);
             }
             EntryKind::DirtyDir {
                 children: Some(children),
             } => {
                 let child = *some!(children.get(name), reply, ENOENT);
                 let child_entry = some!(self.inomap.get(child), reply, ENOENT);
-                return reply.entry(&Self::ttl(), &self.make_attr(child, child_entry), 0);
+                return reply.entry(&Self::ttl(), &Self::make_attr(child, child_entry), 0);
             }
             EntryKind::GitTree { children: None, .. } => match self.do_opendir(parent.into()) {
                 Ok(_) => (),
@@ -113,14 +113,14 @@ impl Filesystem for GitFS {
             } => {
                 let child = *some!(children.get(name), reply, ENOENT);
                 let child_entry = some!(self.inomap.get(child), reply, ENOENT);
-                return reply.entry(&Self::ttl(), &self.make_attr(child, child_entry), 0);
+                return reply.entry(&Self::ttl(), &Self::make_attr(child, child_entry), 0);
             }
             EntryKind::DirtyDir {
                 children: Some(children),
             } => {
                 let child = *some!(children.get(name), reply, ENOENT);
                 let child_entry = some!(self.inomap.get(child), reply, ENOENT);
-                return reply.entry(&Self::ttl(), &self.make_attr(child, child_entry), 0);
+                return reply.entry(&Self::ttl(), &Self::make_attr(child, child_entry), 0);
             }
             EntryKind::GitTree { children: None, .. } => {
                 warn!("children is empty after fill, skipping");
@@ -137,7 +137,8 @@ impl Filesystem for GitFS {
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         let ino = Ino::from(ino);
         let entry = some!(self.inomap.get(ino), reply, ENOENT);
-        return reply.attr(&Self::ttl(), &self.make_attr(ino, entry));
+        return reply.attr(&Self::ttl(), &Self::make_attr(ino, entry));
+    }
     }
 
     fn opendir(&mut self, _req: &Request, ino: u64, _flags: u32, reply: ReplyOpen) {
@@ -286,11 +287,11 @@ impl Filesystem for GitFS {
             } => {
                 io_ok!(file.seek(SeekFrom::Start(offset as u64)), reply);
                 let nbytes = io_ok!(file.write(data), reply);
-                reply.written(nbytes as u32);
+                return reply.written(nbytes as u32);
             }
             _ => {
                 // 1. We should have already replaced all GitBlob with DirtyFile
-                // 2. Such files must have been opened for writing
+                // 2. Such files must have been opened for updating
                 unreachable!()
             }
         }
@@ -354,7 +355,7 @@ impl Filesystem for GitFS {
                 file: None,
             },
         };
-        let attr = self.make_attr(self.inomap.next_ino(), &fentry);
+        let attr = Self::make_attr(self.inomap.next_ino(), &fentry);
         let ino = self.inomap.add(fentry);
         let dir = some!(self.inomap.get_mut(Ino::from(parent)), reply, ENOENT);
         let children = match &mut dir.u {
@@ -390,7 +391,7 @@ impl Filesystem for GitFS {
             size: 0,
             u: EntryKind::DirtyDir { children: None },
         };
-        let attr = self.make_attr(self.inomap.next_ino(), &dentry);
+        let attr = Self::make_attr(self.inomap.next_ino(), &dentry);
         let ino = self.inomap.add(dentry);
         let dir = some!(self.inomap.get_mut(Ino::from(parent)), reply, ENOENT);
         let children = match &mut dir.u {
@@ -686,7 +687,7 @@ impl GitFS {
         Ok(entries)
     }
 
-    fn make_attr(&self, ino: Ino, entry: &Entry) -> FileAttr {
+    fn make_attr(ino: Ino, entry: &Entry) -> FileAttr {
         FileAttr {
             ino: ino.into(),
             size: entry.size as u64,
