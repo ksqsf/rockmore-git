@@ -12,7 +12,7 @@ use std::fs::Permissions;
 use std::io;
 use std::io::SeekFrom;
 use std::io::{Read, Seek, Write};
-use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+use std::os::unix::{ffi::OsStrExt, fs::{PermissionsExt, MetadataExt}};
 use time::Timespec;
 
 use fuse::{
@@ -139,6 +139,35 @@ impl Filesystem for GitFS {
         let entry = some!(self.inomap.get(ino), reply, ENOENT);
         return reply.attr(&Self::ttl(), &Self::make_attr(ino, entry));
     }
+
+    fn setattr(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<Timespec>,
+        mtime: Option<Timespec>,
+        _fh: Option<u64>,
+        crtime: Option<Timespec>,
+        _chgtime: Option<Timespec>,
+        _bkuptime: Option<Timespec>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        let ino = Ino::from(ino);
+        let entry = some!(self.inomap.get_mut(ino), reply, ENOENT);
+        // We are just making up numbers to satisfy FUSE.  Git has its
+        // own idea of these attributes, so don't take them seriously.
+        mode.map(|x| entry.perm = Permissions::from_mode(x));
+        size.map(|x| entry.size = x as usize);
+        atime.map(|x| entry.atime = x);
+        mtime.map(|x| entry.mtime = x);
+        crtime.map(|x| entry.crtime = x);
+        dbg!(&entry);
+        return reply.attr(&Self::ttl(), &Self::make_attr(ino, entry));
     }
 
     fn opendir(&mut self, _req: &Request, ino: u64, _flags: u32, reply: ReplyOpen) {
@@ -287,6 +316,7 @@ impl Filesystem for GitFS {
             } => {
                 io_ok!(file.seek(SeekFrom::Start(offset as u64)), reply);
                 let nbytes = io_ok!(file.write(data), reply);
+                entry.size = io_ok!(file.metadata(), reply).size() as usize;
                 return reply.written(nbytes as u32);
             }
             _ => {
@@ -360,7 +390,7 @@ impl Filesystem for GitFS {
             p.push(name);
             p
         };
-        let _file = io_ok!(self.underlying_dir.write_file(&path, mode as u16), reply);
+        let file = io_ok!(self.underlying_dir.write_file(&path, mode as u16), reply);
         let fentry = Entry {
             name: name.to_owned(),
             parent: Ino::from(parent),
@@ -371,8 +401,8 @@ impl Filesystem for GitFS {
             perm: Permissions::from_mode(mode),
             size: 0,
             u: EntryKind::DirtyFile {
-                refcnt: 0,
-                file: None,
+                refcnt: 1,
+                file: Some(file),
             },
         };
         let attr = Self::make_attr(self.inomap.next_ino(), &fentry);
