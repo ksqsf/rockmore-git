@@ -13,11 +13,11 @@ use std::io;
 use std::io::SeekFrom;
 use std::io::{Read, Seek, Write};
 use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
-use time::Timespec;
+use std::time::{Duration, SystemTime};
 
-use fuse::{
+use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    ReplyEntry, ReplyOpen, ReplyWrite, Request, KernelConfig, TimeOrNow,
 };
 use git2::{Error as GitError, ObjectType, Oid, Repository, Tree};
 use libc::{c_int, mode_t, stat, EIO, EISDIR, ENOENT, ENOTDIR, O_RDONLY};
@@ -66,7 +66,7 @@ impl GitFS {
 
 // file system interfaces
 impl Filesystem for GitFS {
-    fn init(&mut self, _req: &Request) -> Result<(), c_int> {
+    fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> Result<(), c_int> {
         let commit = self.repo.head().unwrap().peel_to_commit().unwrap();
         let tree = commit.tree().unwrap();
         self.inomap.add(self.root_entry(tree));
@@ -148,12 +148,13 @@ impl Filesystem for GitFS {
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
-        atime: Option<Timespec>,
-        mtime: Option<Timespec>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
         _fh: Option<u64>,
-        crtime: Option<Timespec>,
-        _chgtime: Option<Timespec>,
-        _bkuptime: Option<Timespec>,
+        crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
@@ -163,14 +164,20 @@ impl Filesystem for GitFS {
         // own idea of these attributes, so don't take them seriously.
         mode.map(|x| entry.perm = Permissions::from_mode(x));
         size.map(|x| entry.size = x);
-        atime.map(|x| entry.atime = x);
-        mtime.map(|x| entry.mtime = x);
+        atime.map(|x| entry.atime = match x {
+            TimeOrNow::SpecificTime(time) => time,
+            TimeOrNow::Now => SystemTime::now()
+        });
+        mtime.map(|x| entry.mtime = match x {
+            TimeOrNow::SpecificTime(time) => time,
+            TimeOrNow::Now => SystemTime::now()
+        });
         crtime.map(|x| entry.crtime = x);
         dbg!(&entry);
         return reply.attr(&Self::ttl(), &Self::make_attr(ino, entry));
     }
 
-    fn opendir(&mut self, _req: &Request, ino: u64, _flags: u32, reply: ReplyOpen) {
+    fn opendir(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
         let ino = Ino::from(ino);
         match self.do_opendir(ino) {
             Ok(_) => reply.opened(0, 0),
@@ -221,7 +228,7 @@ impl Filesystem for GitFS {
         }
     }
 
-    fn releasedir(&mut self, _req: &Request, ino: u64, _fh: u64, _flags: u32, reply: ReplyEmpty) {
+    fn releasedir(&mut self, _req: &Request, ino: u64, _fh: u64, _flags: i32, reply: ReplyEmpty) {
         let ino = Ino::from(ino);
         let entry = some!(self.inomap.get_mut(ino), reply, ENOENT);
         match entry.u {
@@ -231,9 +238,8 @@ impl Filesystem for GitFS {
         return reply.ok();
     }
 
-    fn open(&mut self, _req: &Request, ino: u64, flags: u32, reply: ReplyOpen) {
+    fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
         dbg!(flags);
-        let flags = flags as i32;
         let ino = Ino::from(ino);
         let entry = some!(self.inomap.get_mut(ino), reply, ENOENT);
         match entry.u {
@@ -271,6 +277,8 @@ impl Filesystem for GitFS {
         _fh: u64,
         offset: i64,
         size: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
         let entry = some!(self.inomap.get_mut(ino.into()), reply, ENOENT);
@@ -303,7 +311,9 @@ impl Filesystem for GitFS {
         _fh: u64,
         offset: i64,
         data: &[u8],
-        _flags: u32,
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
         let ino = Ino::from(ino);
@@ -357,8 +367,8 @@ impl Filesystem for GitFS {
         _req: &Request,
         ino: u64,
         _fh: u64,
-        _flags: u32,
-        _lock_owner: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
@@ -387,7 +397,8 @@ impl Filesystem for GitFS {
         parent: u64,
         name: &OsStr,
         mode: u32,
-        _flags: u32,
+        _umask: u32,
+        _flags: i32,
         reply: ReplyCreate,
     ) {
         let path = {
@@ -399,10 +410,10 @@ impl Filesystem for GitFS {
         let fentry = Entry {
             name: name.to_owned(),
             parent: Ino::from(parent),
-            ctime: time::now().to_timespec(),
-            mtime: time::now().to_timespec(),
-            atime: time::now().to_timespec(),
-            crtime: time::now().to_timespec(),
+            ctime: SystemTime::now(),
+            mtime: SystemTime::now(),
+            atime: SystemTime::now(),
+            crtime: SystemTime::now(),
             perm: Permissions::from_mode(mode),
             size: 0,
             u: EntryKind::DirtyFile {
@@ -428,7 +439,14 @@ impl Filesystem for GitFS {
         reply.created(&Self::ttl(), &attr, 0, 0, 0)
     }
 
-    fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, mode: u32, reply: ReplyEntry) {
+    fn mkdir(&mut self,
+             _req: &Request,
+             parent: u64,
+             name: &OsStr,
+             mode: u32,
+             _umask: u32,
+             reply: ReplyEntry
+    ) {
         let path = {
             let mut p = some!(self.inomap.prefix(Ino::from(parent)), reply, EIO);
             p.push(name);
@@ -438,10 +456,10 @@ impl Filesystem for GitFS {
         let dentry = Entry {
             name: name.to_owned(),
             parent: Ino::from(parent),
-            ctime: time::now().to_timespec(),
-            mtime: time::now().to_timespec(),
-            atime: time::now().to_timespec(),
-            crtime: time::now().to_timespec(),
+            ctime: SystemTime::now(),
+            mtime: SystemTime::now(),
+            atime: SystemTime::now(),
+            crtime: SystemTime::now(),
             perm: Permissions::from_mode(mode),
             size: 0,
             u: EntryKind::DirtyDir { children: None },
@@ -479,6 +497,7 @@ impl Filesystem for GitFS {
         name: &OsStr,
         newparent: u64,
         newname: &OsStr,
+        _flags: u32,
         reply: ReplyEmpty,
     ) {
         let oldp = parent.into();
@@ -509,13 +528,322 @@ impl Filesystem for GitFS {
         newpent.add_child(newname.to_os_string(), c);
         return reply.ok();
     }
+
+    fn destroy(&mut self) {}
+
+    fn forget(&mut self, _req: &Request<'_>, _ino: u64, _nlookup: u64) {}
+
+    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        debug!("[Not Implemented] readlink(ino: {:#x?})", ino);
+        reply.error(libc::ENOSYS);
+    }
+
+    fn mknod(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        debug!(
+            "[Not Implemented] mknod(parent: {:#x?}, name: {:?}, mode: {}, \
+            umask: {:#x?}, rdev: {})",
+            parent, name, mode, umask, rdev
+        );
+        reply.error(libc::ENOSYS);
+    }
+
+    fn symlink(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        link: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        debug!(
+            "[Not Implemented] symlink(parent: {:#x?}, name: {:?}, link: {:?})",
+            parent, name, link,
+        );
+        reply.error(libc::EPERM);
+    }
+
+    fn link(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        newparent: u64,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        debug!(
+            "[Not Implemented] link(ino: {:#x?}, newparent: {:#x?}, newname: {:?})",
+            ino, newparent, newname
+        );
+        reply.error(libc::EPERM);
+    }
+
+    fn fsync(&mut self, _req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
+        debug!(
+            "[Not Implemented] fsync(ino: {:#x?}, fh: {}, datasync: {})",
+            ino, fh, datasync
+        );
+        reply.error(libc::ENOSYS);
+    }
+
+    fn readdirplus(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        reply: fuser::ReplyDirectoryPlus,
+    ) {
+        debug!(
+            "[Not Implemented] readdirplus(ino: {:#x?}, fh: {}, offset: {})",
+            ino, fh, offset
+        );
+        reply.error(libc::ENOSYS);
+    }
+
+    fn fsyncdir(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        debug!(
+            "[Not Implemented] fsyncdir(ino: {:#x?}, fh: {}, datasync: {})",
+            ino, fh, datasync
+        );
+        reply.error(libc::ENOSYS);
+    }
+
+    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
+        reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
+    }
+
+    fn setxattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        _value: &[u8],
+        flags: i32,
+        position: u32,
+        reply: ReplyEmpty,
+    ) {
+        debug!(
+            "[Not Implemented] setxattr(ino: {:#x?}, name: {:?}, flags: {:#x?}, position: {})",
+            ino, name, flags, position
+        );
+        reply.error(libc::ENOSYS);
+    }
+
+    fn getxattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
+        debug!(
+            "[Not Implemented] getxattr(ino: {:#x?}, name: {:?}, size: {})",
+            ino, name, size
+        );
+        reply.error(libc::ENOSYS);
+    }
+
+    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: fuser::ReplyXattr) {
+        debug!(
+            "[Not Implemented] listxattr(ino: {:#x?}, size: {})",
+            ino, size
+        );
+        reply.error(libc::ENOSYS);
+    }
+
+    fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        debug!(
+            "[Not Implemented] removexattr(ino: {:#x?}, name: {:?})",
+            ino, name
+        );
+        reply.error(libc::ENOSYS);
+    }
+
+    fn access(&mut self, _req: &Request<'_>, ino: u64, mask: i32, reply: ReplyEmpty) {
+        debug!("[Not Implemented] access(ino: {:#x?}, mask: {})", ino, mask);
+        reply.error(libc::ENOSYS);
+    }
+
+    fn getlk(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        lock_owner: u64,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        reply: fuser::ReplyLock,
+    ) {
+        debug!(
+            "[Not Implemented] getlk(ino: {:#x?}, fh: {}, lock_owner: {}, start: {}, \
+            end: {}, typ: {}, pid: {})",
+            ino, fh, lock_owner, start, end, typ, pid
+        );
+        reply.error(libc::ENOSYS);
+    }
+
+    fn setlk(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        lock_owner: u64,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        sleep: bool,
+        reply: ReplyEmpty,
+    ) {
+        debug!(
+            "[Not Implemented] setlk(ino: {:#x?}, fh: {}, lock_owner: {}, start: {}, \
+            end: {}, typ: {}, pid: {}, sleep: {})",
+            ino, fh, lock_owner, start, end, typ, pid, sleep
+        );
+        reply.error(libc::ENOSYS);
+    }
+
+    fn bmap(&mut self, _req: &Request<'_>, ino: u64, blocksize: u32, idx: u64, reply: fuser::ReplyBmap) {
+        debug!(
+            "[Not Implemented] bmap(ino: {:#x?}, blocksize: {}, idx: {})",
+            ino, blocksize, idx,
+        );
+        reply.error(libc::ENOSYS);
+    }
+
+    fn ioctl(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        flags: u32,
+        cmd: u32,
+        in_data: &[u8],
+        out_size: u32,
+        reply: fuser::ReplyIoctl,
+    ) {
+        debug!(
+            "[Not Implemented] ioctl(ino: {:#x?}, fh: {}, flags: {}, cmd: {}, \
+            in_data.len(): {}, out_size: {})",
+            ino,
+            fh,
+            flags,
+            cmd,
+            in_data.len(),
+            out_size,
+        );
+        reply.error(libc::ENOSYS);
+    }
+
+    fn fallocate(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        length: i64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        debug!(
+            "[Not Implemented] fallocate(ino: {:#x?}, fh: {}, offset: {}, \
+            length: {}, mode: {})",
+            ino, fh, offset, length, mode
+        );
+        reply.error(libc::ENOSYS);
+    }
+
+    fn lseek(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        whence: i32,
+        reply: fuser::ReplyLseek,
+    ) {
+        debug!(
+            "[Not Implemented] lseek(ino: {:#x?}, fh: {}, offset: {}, whence: {})",
+            ino, fh, offset, whence
+        );
+        reply.error(libc::ENOSYS);
+    }
+
+    fn copy_file_range(
+        &mut self,
+        _req: &Request<'_>,
+        ino_in: u64,
+        fh_in: u64,
+        offset_in: i64,
+        ino_out: u64,
+        fh_out: u64,
+        offset_out: i64,
+        len: u64,
+        flags: u32,
+        reply: ReplyWrite,
+    ) {
+        debug!(
+            "[Not Implemented] copy_file_range(ino_in: {:#x?}, fh_in: {}, \
+            offset_in: {}, ino_out: {:#x?}, fh_out: {}, offset_out: {}, \
+            len: {}, flags: {})",
+            ino_in, fh_in, offset_in, ino_out, fh_out, offset_out, len, flags
+        );
+        reply.error(libc::ENOSYS);
+    }
+
+    fn setvolname(&mut self, _req: &Request<'_>, name: &OsStr, reply: ReplyEmpty) {
+        debug!("[Not Implemented] setvolname(name: {:?})", name);
+        reply.error(libc::ENOSYS);
+    }
+
+    fn exchange(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        options: u64,
+        reply: ReplyEmpty,
+    ) {
+        debug!(
+            "[Not Implemented] exchange(parent: {:#x?}, name: {:?}, newparent: {:#x?}, \
+            newname: {:?}, options: {})",
+            parent, name, newparent, newname, options
+        );
+        reply.error(libc::ENOSYS);
+    }
+
+    fn getxtimes(&mut self, _req: &Request<'_>, ino: u64, reply: fuser::ReplyXTimes) {
+        debug!("[Not Implemented] getxtimes(ino: {:#x?})", ino);
+        reply.error(libc::ENOSYS);
+    }
 }
 
 // private interfaces
 impl GitFS {
     /// by default, ttl = 1 second
-    fn ttl() -> Timespec {
-        Timespec::new(1, 0)
+    fn ttl() -> Duration {
+        Duration::from_secs(1)
     }
 
     /// Create the root entry.
@@ -523,10 +851,10 @@ impl GitFS {
     fn root_entry(&self, tree: Tree<'_>) -> Entry {
         let metadata = self.underlying_dir.self_metadata().unwrap();
         let stat = metadata.stat();
-        let atime = Timespec::new(stat.st_atime, stat.st_atime_nsec as i32);
-        let mtime = Timespec::new(stat.st_mtime, stat.st_mtime_nsec as i32);
-        let ctime = Timespec::new(stat.st_ctime, stat.st_ctime_nsec as i32);
-        let crtime = Timespec::new(stat.st_birthtime, stat.st_birthtime_nsec as i32);
+        let atime = SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_atime as u64);
+        let ctime = SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_ctime as u64);
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_mtime as u64);
+        let crtime = SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_birthtime as u64);
         Entry {
             name: "".to_string().into(),
             parent: Ino::ROOT,
@@ -723,7 +1051,7 @@ impl GitFS {
         }
     }
 
-    fn walk_tree(&self, ino: Ino, tree_id: Oid) -> Result<(HashMap<OsString, Entry>), GitError> {
+    fn walk_tree(&self, ino: Ino, tree_id: Oid) -> Result<HashMap<OsString, Entry>, GitError> {
         let tree = self.repo.find_tree(tree_id)?;
         let mut entries = HashMap::new();
 
@@ -736,12 +1064,12 @@ impl GitFS {
                     Entry {
                         name: name.clone(),
                         parent: ino,
-                        size: blob.size(),
+                        size: blob.size() as u64,
                         perm,
-                        ctime: Timespec::new(0, 0),
-                        atime: Timespec::new(0, 0),
-                        mtime: Timespec::new(0, 0),
-                        crtime: Timespec::new(0, 0),
+                        ctime: SystemTime::UNIX_EPOCH,
+                        atime: SystemTime::UNIX_EPOCH,
+                        mtime: SystemTime::UNIX_EPOCH,
+                        crtime: SystemTime::UNIX_EPOCH,
                         u: EntryKind::GitBlob {
                             oid: tree_entry.id(),
                         },
@@ -752,10 +1080,10 @@ impl GitFS {
                     name: name.clone(),
                     perm: Permissions::from_mode(0o755), // tree doesn't have a proper mode
                     size: 0,
-                    ctime: Timespec::new(0, 0),
-                    atime: Timespec::new(0, 0),
-                    mtime: Timespec::new(0, 0),
-                    crtime: Timespec::new(0, 0),
+                    ctime: SystemTime::UNIX_EPOCH,
+                    atime: SystemTime::UNIX_EPOCH,
+                    mtime: SystemTime::UNIX_EPOCH,
+                    crtime: SystemTime::UNIX_EPOCH,
                     u: EntryKind::GitTree {
                         oid: tree_entry.id(),
                         children: None,
@@ -782,7 +1110,7 @@ impl GitFS {
         &self,
         ino: Ino,
         tree_id: Option<Oid>,
-    ) -> Result<(HashMap<OsString, Entry>), c_int> {
+    ) -> Result<HashMap<OsString, Entry>, c_int> {
         let mut entries = match tree_id {
             Some(tree_id) => self.walk_tree(ino, tree_id).map_err(|_| ENOENT)?,
             None => HashMap::new(),
@@ -836,9 +1164,9 @@ impl GitFS {
                                 parent: ino,
                                 perm: Permissions::from_mode(stat.st_mode as u32),
                                 size: stat.st_size as u64,
-                                atime: Timespec::new(stat.st_atime, stat.st_atime_nsec as i32),
-                                mtime: Timespec::new(stat.st_mtime, stat.st_mtime_nsec as i32),
-                                ctime: Timespec::new(stat.st_ctime, stat.st_ctime_nsec as i32),
+                                atime: SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_atime as u64),
+                                mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_mtime as u64),
+                                ctime: SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_ctime as u64),
                                 crtime: birthtime(stat),
                                 u: EntryKind::DirtyDir { children: None },
                             },
@@ -852,13 +1180,13 @@ impl GitFS {
                     entries.insert(
                         name.clone(),
                         Entry {
-                            name: name,
+                            name,
                             parent: ino,
                             perm: Permissions::from_mode(stat.st_mode as u32),
                             size: stat.st_size as u64,
-                            atime: Timespec::new(stat.st_atime, stat.st_atime_nsec as i32),
-                            mtime: Timespec::new(stat.st_mtime, stat.st_mtime_nsec as i32),
-                            ctime: Timespec::new(stat.st_ctime, stat.st_ctime_nsec as i32),
+                            atime: SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_atime as u64),
+                            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_mtime as u64),
+                            ctime: SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_ctime as u64),
                             crtime: birthtime(stat),
                             u: EntryKind::DirtyFile {
                                 file: None,
@@ -896,17 +1224,18 @@ impl GitFS {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             rdev: 0,
+            blksize: 0,
             flags: 0,
         }
     }
 }
 
 #[cfg(target_os = "macos")]
-fn birthtime(stat: &stat) -> Timespec {
-    Timespec::new(stat.st_birthtime, stat.st_birthtime_nsec as i32)
+fn birthtime(stat: &stat) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_birthtime as u64)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn birthtime(_: &stat) -> Timespec {
-    Timespec::new(0, 0)
+fn birthtime(_: &stat) -> SystemTime {
+    SystemTime::UNIX_EPOCH
 }

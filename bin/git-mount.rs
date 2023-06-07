@@ -1,6 +1,5 @@
-use std::ffi::OsStr;
 use git2::*;
-use fuse;
+use fuser::{self, MountOption};
 use env_logger;
 use std::env;
 use openat::Dir;
@@ -16,9 +15,10 @@ fn main() {
     let repo = Repository::open(repo_path).unwrap();
 
     let fs = GitFS::new(repo, dir);
-    let options = ["-o", "nonempty", "-o", "fsname=gitfs"]
-        .iter()
-        .map(|x| x.as_ref())
-        .collect::<Vec<&OsStr>>();
-    fuse::mount(fs, &mountpoint, &options).unwrap();
+    let options = [
+        MountOption::AutoUnmount,
+        MountOption::FSName("gitfs".to_string()),
+        MountOption::CUSTOM("nonempty".to_string())
+    ];
+    fuser::mount2(fs, &mountpoint, &options).unwrap();
 }

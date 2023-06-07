@@ -5,10 +5,10 @@ use std::ops::AddAssign;
 use std::fs::{File, Permissions};
 use std::path::PathBuf;
 use std::ffi::{OsString, OsStr};
+use std::time::SystemTime;
 
 use git2::Oid;
-use time::Timespec;
-use fuse::FileType;
+use fuser::FileType;
 
 #[macro_use]
 extern crate log;
@@ -112,16 +112,16 @@ struct Entry {
     parent: Ino,
 
     /// File status changed.
-    ctime: Timespec,
+    ctime: SystemTime,
 
     /// Last accessed.
-    atime: Timespec,
+    atime: SystemTime,
 
     /// Data modified.
-    mtime: Timespec,
+    mtime: SystemTime,
 
     /// Created.
-    crtime: Timespec,
+    crtime: SystemTime,
 
     /// Permission bits.
     perm: Permissions,
