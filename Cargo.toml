@@ -12,8 +12,11 @@ path = "bin/git-mount.rs"
 
 [dependencies]
 fuser = "0.16"
+# We only need local repository access; disabling default git2 features
+# avoids pulling SSH/HTTPS stacks with additional vulnerable transitive deps.
 git2 = { version = "0.21", default-features = false }
 log = "0.4"
+# Keep env_logger lean to avoid unmaintained optional transitive proc-macro deps.
 env_logger = { version = "0.11", default-features = false }
-libc = "0.2.62"
+libc = "0.2.186"
 openat = "0.1"
