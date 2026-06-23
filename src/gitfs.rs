@@ -134,7 +134,7 @@ impl Filesystem for GitFS {
         }
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         let ino = Ino::from(ino);
         let entry = some!(self.inomap.get(ino), reply, ENOENT);
         return reply.attr(&Self::ttl(), &Self::make_attr(ino, entry));
@@ -810,11 +810,13 @@ impl Filesystem for GitFS {
         reply.error(libc::ENOSYS);
     }
 
+    #[cfg(target_os = "macos")]
     fn setvolname(&mut self, _req: &Request<'_>, name: &OsStr, reply: ReplyEmpty) {
         debug!("[Not Implemented] setvolname(name: {:?})", name);
         reply.error(libc::ENOSYS);
     }
 
+    #[cfg(target_os = "macos")]
     fn exchange(
         &mut self,
         _req: &Request<'_>,
@@ -833,6 +835,7 @@ impl Filesystem for GitFS {
         reply.error(libc::ENOSYS);
     }
 
+    #[cfg(target_os = "macos")]
     fn getxtimes(&mut self, _req: &Request<'_>, ino: u64, reply: fuser::ReplyXTimes) {
         debug!("[Not Implemented] getxtimes(ino: {:#x?})", ino);
         reply.error(libc::ENOSYS);
@@ -851,10 +854,10 @@ impl GitFS {
     fn root_entry(&self, tree: Tree<'_>) -> Entry {
         let metadata = self.underlying_dir.self_metadata().unwrap();
         let stat = metadata.stat();
-        let atime = SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_atime as u64);
-        let ctime = SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_ctime as u64);
-        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_mtime as u64);
-        let crtime = SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_birthtime as u64);
+        let atime = system_time_from_unix_parts(stat.st_atime, 0);
+        let ctime = system_time_from_unix_parts(stat.st_ctime, 0);
+        let mtime = system_time_from_unix_parts(stat.st_mtime, 0);
+        let crtime = system_time_from_unix_parts(stat.st_birthtime, 0);
         Entry {
             name: "".to_string().into(),
             parent: Ino::ROOT,
@@ -875,10 +878,10 @@ impl GitFS {
     fn root_entry(&self, tree: Tree<'_>) -> Entry {
         let metadata = self.underlying_dir.self_metadata().unwrap();
         let stat = metadata.stat();
-        let atime = Timespec::new(stat.st_atime, stat.st_atime_nsec as i32);
-        let mtime = Timespec::new(stat.st_mtime, stat.st_mtime_nsec as i32);
-        let ctime = Timespec::new(stat.st_ctime, stat.st_ctime_nsec as i32);
-        let crtime = Timespec::new(0, 0);
+        let atime = system_time_from_unix_parts(stat.st_atime, stat.st_atime_nsec);
+        let mtime = system_time_from_unix_parts(stat.st_mtime, stat.st_mtime_nsec);
+        let ctime = system_time_from_unix_parts(stat.st_ctime, stat.st_ctime_nsec);
+        let crtime = SystemTime::UNIX_EPOCH;
         Entry {
             name: "".to_string().into(),
             parent: Ino::ROOT,
@@ -1164,9 +1167,9 @@ impl GitFS {
                                 parent: ino,
                                 perm: Permissions::from_mode(stat.st_mode as u32),
                                 size: stat.st_size as u64,
-                                atime: SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_atime as u64),
-                                mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_mtime as u64),
-                                ctime: SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_ctime as u64),
+                                atime: system_time_from_unix_parts(stat.st_atime, 0),
+                                mtime: system_time_from_unix_parts(stat.st_mtime, 0),
+                                ctime: system_time_from_unix_parts(stat.st_ctime, 0),
                                 crtime: birthtime(stat),
                                 u: EntryKind::DirtyDir { children: None },
                             },
@@ -1184,9 +1187,9 @@ impl GitFS {
                             parent: ino,
                             perm: Permissions::from_mode(stat.st_mode as u32),
                             size: stat.st_size as u64,
-                            atime: SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_atime as u64),
-                            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_mtime as u64),
-                            ctime: SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_ctime as u64),
+                            atime: system_time_from_unix_parts(stat.st_atime, 0),
+                            mtime: system_time_from_unix_parts(stat.st_mtime, 0),
+                            ctime: system_time_from_unix_parts(stat.st_ctime, 0),
                             crtime: birthtime(stat),
                             u: EntryKind::DirtyFile {
                                 file: None,
@@ -1238,4 +1241,30 @@ fn birthtime(stat: &stat) -> SystemTime {
 #[cfg(not(target_os = "macos"))]
 fn birthtime(_: &stat) -> SystemTime {
     SystemTime::UNIX_EPOCH
+}
+
+/// Convert signed unix timestamp parts into `SystemTime` without lossy casts.
+///
+/// Handles pre-epoch times by subtracting from `UNIX_EPOCH` and uses i128
+/// arithmetic to avoid overflow when combining seconds and nanoseconds.
+fn system_time_from_unix_parts(secs: i64, nanos: i64) -> SystemTime {
+    const NANOS_PER_SEC: i128 = 1_000_000_000;
+    let total_nanos = (secs as i128) * NANOS_PER_SEC + (nanos as i128);
+    if total_nanos >= 0 {
+        let total_nanos = total_nanos as u128;
+        let secs = (total_nanos / NANOS_PER_SEC as u128) as u64;
+        let nanos = (total_nanos % NANOS_PER_SEC as u128) as u32;
+        SystemTime::UNIX_EPOCH + Duration::new(secs, nanos)
+    } else {
+        let total_nanos = (-total_nanos) as u128;
+        let secs = (total_nanos / NANOS_PER_SEC as u128) as u64;
+        let nanos = (total_nanos % NANOS_PER_SEC as u128) as u32;
+        let fallback = SystemTime::UNIX_EPOCH
+            .checked_sub(Duration::new(secs, nanos))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        if fallback == SystemTime::UNIX_EPOCH {
+            warn!("timestamp underflow during unix time conversion, clamped to UNIX_EPOCH");
+        }
+        fallback
+    }
 }
