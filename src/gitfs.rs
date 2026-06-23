@@ -1235,7 +1235,7 @@ impl GitFS {
 
 #[cfg(target_os = "macos")]
 fn birthtime(stat: &stat) -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_birthtime as u64)
+    system_time_from_unix_parts(stat.st_birthtime, 0)
 }
 
 #[cfg(not(target_os = "macos"))]
