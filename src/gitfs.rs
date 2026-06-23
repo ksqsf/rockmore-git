@@ -134,7 +134,7 @@ impl Filesystem for GitFS {
         }
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         let ino = Ino::from(ino);
         let entry = some!(self.inomap.get(ino), reply, ENOENT);
         return reply.attr(&Self::ttl(), &Self::make_attr(ino, entry));
@@ -810,11 +810,13 @@ impl Filesystem for GitFS {
         reply.error(libc::ENOSYS);
     }
 
+    #[cfg(target_os = "macos")]
     fn setvolname(&mut self, _req: &Request<'_>, name: &OsStr, reply: ReplyEmpty) {
         debug!("[Not Implemented] setvolname(name: {:?})", name);
         reply.error(libc::ENOSYS);
     }
 
+    #[cfg(target_os = "macos")]
     fn exchange(
         &mut self,
         _req: &Request<'_>,
@@ -833,6 +835,7 @@ impl Filesystem for GitFS {
         reply.error(libc::ENOSYS);
     }
 
+    #[cfg(target_os = "macos")]
     fn getxtimes(&mut self, _req: &Request<'_>, ino: u64, reply: fuser::ReplyXTimes) {
         debug!("[Not Implemented] getxtimes(ino: {:#x?})", ino);
         reply.error(libc::ENOSYS);
@@ -875,10 +878,10 @@ impl GitFS {
     fn root_entry(&self, tree: Tree<'_>) -> Entry {
         let metadata = self.underlying_dir.self_metadata().unwrap();
         let stat = metadata.stat();
-        let atime = Timespec::new(stat.st_atime, stat.st_atime_nsec as i32);
-        let mtime = Timespec::new(stat.st_mtime, stat.st_mtime_nsec as i32);
-        let ctime = Timespec::new(stat.st_ctime, stat.st_ctime_nsec as i32);
-        let crtime = Timespec::new(0, 0);
+        let atime = SystemTime::UNIX_EPOCH + Duration::new(stat.st_atime as u64, stat.st_atime_nsec as u32);
+        let mtime = SystemTime::UNIX_EPOCH + Duration::new(stat.st_mtime as u64, stat.st_mtime_nsec as u32);
+        let ctime = SystemTime::UNIX_EPOCH + Duration::new(stat.st_ctime as u64, stat.st_ctime_nsec as u32);
+        let crtime = SystemTime::UNIX_EPOCH;
         Entry {
             name: "".to_string().into(),
             parent: Ino::ROOT,

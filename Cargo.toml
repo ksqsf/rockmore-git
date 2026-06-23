@@ -12,8 +12,8 @@ path = "bin/git-mount.rs"
 
 [dependencies]
 fuser = "0.16"
-git2 = "0.20"
+git2 = { version = "0.21", default-features = false }
 log = "0.4"
-env_logger = "0.11"
+env_logger = { version = "0.11", default-features = false }
 libc = "0.2.62"
 openat = "0.1"
